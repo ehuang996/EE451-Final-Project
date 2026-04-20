@@ -1,7 +1,7 @@
 // =============================================================================
 // svm.cpp — Serial and Parallel Linear SVM (hinge loss + L2 regularisation)
-// Dataset  : cs_go_winner_data_train.csv / cs_go_winner_data_test.csv
-//            (96 features, labels: CT / T)
+// Dataset  : train_cleaned.csv / test_cleaned.csv
+//            (103 features, label: round_winner in {+1, -1})
 // Language : C++17
 // =============================================================================
 
@@ -17,7 +17,6 @@
 #include <random>
 #include <iomanip>
 #include <cassert>
-#include <unordered_map>
 #include <pthread.h>
 
 #ifdef _OPENMP
@@ -27,7 +26,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Hyperparameters
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr int    N_FEATURES  = 96;     // number of features in the dataset
+static constexpr int    N_FEATURES  = 103;     // number of features in the dataset
 static constexpr double LAMBDA      = 1e-4;   // L2 regularisation strength
 static constexpr int    MAX_EPOCHS  = 200;     // full-pass epochs over training set
 static constexpr double LR          = 0.01;   // learning rate (fixed)
@@ -64,10 +63,7 @@ struct Dataset {
 };
 
 Dataset load_dataset(const std::string& train_path, const std::string& test_path) {
-    std::unordered_map<std::string, int> map_enc;
-    int map_next_id = 0;
-
-    auto parse_row = [&](const std::string& line, bool build_map)
+    auto parse_row = [&](const std::string& line, bool /*build_map*/)
                      -> std::pair<Vec, int> {
         Vec row;
         row.reserve(N_FEATURES);
@@ -75,19 +71,9 @@ Dataset load_dataset(const std::string& train_path, const std::string& test_path
         std::string tok;
         int col = 0, label = 0;
         while (std::getline(ss, tok, ',')) {
-            if (col == 96) {
-                // Label column: "CT" → +1, anything else → -1
-                label = (tok == "CT") ? 1 : -1;
-            } else if (col == 3) {
-                // map name: ordinal encode
-                if (build_map && map_enc.find(tok) == map_enc.end())
-                    map_enc[tok] = map_next_id++;
-                auto it = map_enc.find(tok);
-                row.push_back(it != map_enc.end()
-                              ? static_cast<double>(it->second) : 0.0);
-            } else if (col == 4) {
-                // bomb_planted: True → 1.0, False → 0.0
-                row.push_back(tok == "True" ? 1.0 : 0.0);
+            if (col == 95) {
+                // round_winner column: already +1 or -1
+                label = std::stoi(tok);
             } else {
                 row.push_back(std::stod(tok));
             }
@@ -149,7 +135,23 @@ Dataset load_dataset(const std::string& train_path, const std::string& test_path
     norm_inplace(ds.X_train);
     norm_inplace(ds.X_test);
 
-    std::cout << "Loaded  train: " << n_train << "  test: " << n_test << "\n\n";
+    // Count class distribution
+    int tr_pos = 0, tr_neg = 0, te_pos = 0, te_neg = 0;
+    for (int l : ds.y_train) (l == 1 ? tr_pos : tr_neg)++;
+    for (int l : ds.y_test)  (l == 1 ? te_pos : te_neg)++;
+
+    std::cout << "┌─────────────────────────────────────────────────┐\n";
+    std::cout << "│  Dataset Info                                   │\n";
+    std::cout << "├─────────────────────────────────────────────────┤\n";
+    std::cout << "│  X_train : " << n_train << " x " << N_FEATURES
+              << std::string(37 - std::to_string(n_train).size()
+                                - std::to_string(N_FEATURES).size(), ' ') << "\n";
+    std::cout << "│  X_test  : " << n_test  << " x " << N_FEATURES
+              << std::string(37 - std::to_string(n_test).size()
+                                - std::to_string(N_FEATURES).size(), ' ') << "\n";
+    std::cout << "│  y_train : +1=" << tr_pos << "  -1=" << tr_neg << "\n";
+    std::cout << "│  y_test  : +1=" << te_pos << "  -1=" << te_neg << "\n";
+    std::cout << "└─────────────────────────────────────────────────┘\n\n";
     return ds;
 }
 
@@ -432,8 +434,8 @@ static void print_results(const std::string& tag,
 // ─────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
-    std::string train_csv = "cs_go_winner_data_train.csv";
-    std::string test_csv  = "cs_go_winner_data_test.csv";
+    std::string train_csv = "train_cleaned.csv";
+    std::string test_csv  = "test_cleaned.csv";
     if (argc > 1) train_csv = argv[1];
     if (argc > 2) test_csv  = argv[2];
 
@@ -451,6 +453,7 @@ int main(int argc, char* argv[]) {
     double t_load_end = now_ms();
     std::cout << std::fixed << std::setprecision(2)
               << "Data loading: " << (t_load_end - t_load_start) << " ms\n\n";
+    
 
     // ── Serial SVM ───────────────────────────────────────────────────────────
     double ts0 = now_ms();
