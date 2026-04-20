@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/harryyang/USC/sem_2/PDC/EE451-Final-Project/svm",
+      "program": "/Users/harryyang/USC/sem_2/PDC/EE451-Final-Project/svm/build/Debug/outDebug"
+    }
+  ]
+}
