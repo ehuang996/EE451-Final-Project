@@ -1,0 +1,38 @@
+==========================================
+SLURM_JOB_ID = 8218390
+SLURM_JOB_NODELIST = a03-09
+TMPDIR = /tmp/SLURM_8218390
+==========================================
+SVM - CS:GO Round Winner Classification
+Config: epochs=20  lr=0.02  lambda=0.0001  threads=8
+
+Dataset Info
+  X_train: 97928 x 103
+  X_test : 24482 x 103
+  y_train: +1=47982  -1=49946
+  y_test : +1=12022  -1=12460
+
+Data loading + normalization: 2250.26 ms
+
+[Serial SVM]
+  Training time  : 180.21 ms
+  Inference time : 2.13 ms
+  Total time     : 182.34 ms
+  Accuracy       : 0.7317
+  Precision      : 0.7307
+  Recall         : 0.7183
+  F1 Score       : 0.7245
+
+[Parallel SVM (OpenMP, 8 threads)]
+  Training time  : 267.96 ms
+  Inference time : 11.42 ms
+  Total time     : 279.38 ms
+  Accuracy       : 0.7317
+  Precision      : 0.7307
+  Recall         : 0.7183
+  F1 Score       : 0.7245
+
+Speedup Summary
+  Serial total   : 182.34 ms
+  Parallel total : 279.38 ms
+  Speedup        : 0.65 x
