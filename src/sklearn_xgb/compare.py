@@ -8,19 +8,25 @@ the C++ binaries read), defaulting to 8. Set before invocation:
 
     N_THREADS=4 python compare.py
 
-This pins OMP_NUM_THREADS / MKL_NUM_THREADS / OPENBLAS_NUM_THREADS AND passes
-n_jobs to sklearn KNN and XGBoost. Models sklearn runs serially by design
+This pins common OpenMP / BLAS thread environment variables and passes n_jobs
+to sklearn KNN and XGBoost. Models sklearn runs serially by design
 (SGDClassifier, DecisionTreeClassifier, GaussianNB, BernoulliNB) still report
 n_threads=1 in the CSV regardless of the env var.
 """
 
 from __future__ import annotations
 
-# Pin BLAS threading BEFORE importing numpy / sklearn / xgboost. Read the
-# unified N_THREADS env var that the C++ binaries also read; default 8.
+# Pin BLAS/threadpool backends BEFORE importing numpy / sklearn / xgboost.
+# Read the unified N_THREADS env var that the C++ binaries also read; default 8.
 import os
 _N_THREADS = max(1, int(os.environ.get("N_THREADS", "8")))
-for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+for _var in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+):
     os.environ[_var] = str(_N_THREADS)
 
 import argparse
