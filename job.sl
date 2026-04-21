@@ -6,7 +6,9 @@
 #SBATCH --output=gpujob.out
 
 # Compile
-g++ -std=c++17 -O3 -march=native -fopenmp svm.cpp -o svm -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp svm/svm.cpp -o svm -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp mlp/mlp.cpp -o mlp -lpthread
 
 # Run
 ./svm train_cleaned.csv test_cleaned.csv
+./mlp train_cleaned.csv test_cleaned.csv
