@@ -20,22 +20,25 @@ at 8 threads, because at our problem size the triple-nested distance loop is
 actually compute-bound — bandwidth would only bite at 32+ threads. Details in
 [results/results.md §"Hypothesis vs reality"](../results/results.md).
 
-**Key cross-framework finding.** Sklearn's `algorithm="brute"` KNN beats our
-implementation by 16× at T=8 — but *not* because of better parallelism. Sklearn
-reformulates the distance matrix as a single dense GEMM
-(`‖a − b‖² = ‖a‖² + ‖b‖² − 2·a·b`) and delegates to OpenBLAS/MKL. Both sides
-scale ~6.2× from T=1 to T=8; sklearn just starts 16× ahead at T=1. This is the
-paper's central "algorithm vs parallelism" narrative thread.
+**Key cross-framework finding.** Sklearn's `algorithm="brute"` KNN beat the
+original pure C++ implementation by 16× at T=8 — but *not* because sklearn was
+serial and we were parallel. Our comparison harness passes `n_jobs=N_THREADS`
+to `KNeighborsClassifier`, and sklearn's brute Euclidean path uses optimized
+pairwise-distance reductions before falling back to chunked `n_jobs` work when
+needed. The bigger difference was kernel formulation: sklearn evaluates the
+distance matrix through a BLAS-style dot product
+(`‖a − b‖² = ‖a‖² + ‖b‖² − 2·a·b`) instead of a scalar `(xq[j] - xi[j])²`
+inner loop.
 
 **Implementation update (2026-04-21).** We moved our KNN kernel from a direct
 single-query squared-distance loop to a cache-blocked dot-product formulation:
 precompute `‖xi‖²`, process 16 test queries at a time, and evaluate distances as
-`‖xq‖² + ‖xi‖² − 2·xq·xi`. This is still pure C++17 plus OpenMP/pthreads, not a
-BLAS dependency. Local targeted pthread timing improved from 24.35 s to 7.83 s
-on the full test split, with the same 0.8104 accuracy. It still does not beat
-sklearn locally; a temporary Accelerate/BLAS prototype reached ~1.8 s vs
-sklearn's ~1.6 s on the same Mac, confirming that the remaining gap is
-vendor-BLAS kernel quality rather than thread dispatch.
+`‖xq‖² + ‖xi‖² − 2·xq·xi`. The default build remains pure C++17 plus
+OpenMP/pthreads for apples-to-apples project results, and now there is an
+optional `KNN_USE_BLAS` backend that calls CBLAS `sgemm` on query blocks.
+With Apple Accelerate capped to one internal BLAS thread and our pthreads
+owning the outer query parallelism, local full-split inference improved to
+0.592 s vs. 1.586 s for the matching local sklearn brute KNN run.
 
 ---
 
@@ -44,8 +47,10 @@ vendor-BLAS kernel quality rather than thread dispatch.
 For each test sample `xq`:
 1. Compute squared-L2 distance to every training sample using the equivalent
    dot-product identity `d²(xq, xi) = ‖xq‖² + ‖xi‖² − 2·xq·xi`.
-2. Process `QUERY_BLOCK = 16` test samples at a time, so each training row is
-   loaded once and reused across the block.
+2. Default pure C++ backend: process `QUERY_BLOCK = 16` test samples at a time,
+   so each training row is loaded once and reused across the block.
+   Optional BLAS backend: process `KNN_BLAS_BLOCK` queries at a time and use
+   CBLAS `sgemm` for `X_test_block @ X_train.T`.
 3. Track the k smallest distances via an O(k) linear-scan heap kept in
    `best_dist[0..k]` / `best_label[0..k]`. On each new candidate distance less
    than the current worst, replace that slot and rescan for the new max.
@@ -85,10 +90,13 @@ for (int j = 0; j < n_features; ++j)
     dist[q] += -2.0f * xi[j] * qbuf[j][q];
 ```
 
-This is the same formulation sklearn uses before dispatching to BLAS, but our
-implementation remains a hand-written C++ loop rather than a full GEMM kernel.
-It improves cache reuse and vectorization opportunities, but it does not match
-OpenBLAS/MKL/Accelerate's register blocking and assembly microkernels.
+This is the same formulation sklearn uses before dispatching to optimized
+pairwise-distance kernels. The default backend keeps it as a hand-written C++
+loop. When compiled with `KNN_USE_BLAS`, the implementation calls vendor CBLAS
+`sgemm` for the dot matrix and keeps the top-k scan, voting, and outer
+query-block scheduling in our code. That path uses OpenBLAS/MKL/Accelerate's
+register blocking and assembly microkernels without giving up control over the
+outer pthread/OpenMP schedule.
 
 ### Tie-breaking on majority vote
 
@@ -104,6 +112,10 @@ label wins. Deterministic and matches sklearn's behavior.
 K_NEIGHBORS = 11     (default, overridable as argv[3])
 N_THREADS   = 8      (default; overridable via N_THREADS env var — used by the
                      thread-sweep harness to run {1,2,4,8} with the same binary)
+KNN_BACKEND = blas | blocked
+                    (only relevant for a BLAS-compiled binary; default is
+                     blas when CBLAS is available, blocked otherwise)
+KNN_BLAS_BLOCK = 256 (default BLAS query block; only used by the BLAS backend)
 ```
 
 `K_NEIGHBORS = 11` is odd (avoids ties in the common case) and matches the
@@ -114,6 +126,11 @@ KNN has no learning rate, no regularization, no iteration — the CLI is
 `N_THREADS` is `static int` (not `constexpr`) so the environment variable can
 override it at startup for the sweep. Threading during inference reads the
 then-current value.
+
+For outer-parallel BLAS runs, cap the vendor library to one internal thread
+(`OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, or `VECLIB_MAXIMUM_THREADS=1`).
+Otherwise each of our worker threads can spawn its own BLAS thread team and
+oversubscribe the node.
 
 ---
 
@@ -233,8 +250,10 @@ story is moved to inference, where it actually happens.
 
 ## 6. Inference — three variants (this is the hot loop)
 
-All three variants call the same blocked kernel. They differ only in how
-`ceil(n_test / QUERY_BLOCK)` query blocks are distributed across threads.
+All three variants call the active backend: pure C++ blocked-dot by default,
+or BLAS-backed SGEMM when compiled with `KNN_USE_BLAS` and not overridden by
+`KNN_BACKEND=blocked`. They differ only in how query blocks are distributed
+across threads.
 
 ### 6a. `predict_serial`
 
@@ -287,6 +306,27 @@ form of that pattern (no reduction, no barrier, no mutex), and exists as a
 clean baseline for what OMP-vs-pthreads overhead looks like on an
 embarrassingly-parallel workload.
 
+### 6d. Optional BLAS backend
+
+When `KNN_USE_BLAS` is defined, the prediction entry points dispatch to:
+
+```cpp
+cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+            q_count, n_train, n_features,
+            1.0f, X_test_block, n_features,
+            X_train, n_features,
+            0.0f, dots, n_train);
+```
+
+Then the same top-k scan evaluates
+`d² = test_norm2[q] + train_norm2[i] - 2 * dots[q, i]`. The BLAS backend keeps
+exact brute-force KNN semantics; it only replaces the dot-product inner kernel.
+
+The important scheduling choice is nested parallelism. For the fastest local
+path, BLAS is pinned to one internal thread and our pthreads split the query
+range across workers. That gives vendor-quality SGEMM microkernels inside each
+worker without creating `N_THREADS × BLAS_THREADS` runnable threads.
+
 ### Cost model per query
 
 For each query block, `predict_query_block` touches:
@@ -302,9 +342,11 @@ For each query block, `predict_query_block` touches:
 Compared with the old query-major loop, the current block-major loop trades a
 little more per-model setup (`norm2`) for much better training-row reuse. The
 local pthread targeted benchmark improved from 24.35 s to 7.83 s on the full
-split. At T=8, the same high-level scaling story still applies: threads split
-query blocks, share read-only training data through L3, and synchronize only at
-the final join/barrier.
+split. The BLAS backend adds a `KNN_BLAS_BLOCK × n_train` dot buffer per worker
+(default `256 × 97,929 × 4 B ≈ 96 MB`), so an 8-thread run uses roughly
+770 MB of transient dot buffers. At T=8, the high-level scaling story still
+applies: threads split query blocks, share read-only training data through L3,
+and synchronize only at the final join/barrier.
 
 ---
 
@@ -326,6 +368,10 @@ Effective per-pair arithmetic intensity is therefore **~0.5 FLOP/byte** before
 accounting for query-block reuse and L3 sharing. It remains in the same
 low-AI class as SVM and NB, but the blocked formulation substantially improves
 constant factors.
+
+The BLAS backend does not change the exact algorithm or big-O cost. It improves
+the constant by handing the dot-product panel to a tuned SGEMM microkernel, then
+returns to our scalar top-k reduction.
 
 **Why we scaled despite low AI.** The per-pair AI number is not the full
 story. What actually matters is the **DRAM** intensity, because the train
@@ -362,12 +408,12 @@ total serial time, so *any* per-epoch/per-worker overhead is visible at T=8.
 
 ## 8. Numerical & correctness risks
 
-1. **Float dot-product distance ordering.** The current kernel computes
-   `‖xq‖² + ‖xi‖² − 2·xq·xi` in `float`. This is the right formulation for a
-   BLAS-like implementation, but it can perturb near-tie distances compared
-   with the old direct `double` squared-L2 loop. The observed accuracy remains
-   0.8104 on the full local targeted run, and serial/OMP/pthreads parity is
-   still enforced within each binary run.
+1. **Float dot-product distance ordering.** Both active kernels compute
+   `‖xq‖² + ‖xi‖² − 2·xq·xi` in `float`. This is the right formulation for
+   BLAS, but it can perturb near-tie distances compared with the old direct
+   `double` squared-L2 loop. The observed accuracy remains in the same band
+   (`0.8101` to `0.8104` locally), and serial/OMP/pthreads parity is still
+   enforced within each binary run.
 2. **Unstable majority-vote on even k.** `K_NEIGHBORS = 11` is odd, so
    strict majority vote always breaks ties. If a future run uses even k, the
    current code falls back to the nearest-neighbor's label on `pos == neg`
@@ -390,6 +436,11 @@ total serial time, so *any* per-epoch/per-worker overhead is visible at T=8.
    `total_ms = train_ms + infer_ms` to compare against the other
    algorithms; train_ms is still tiny compared with inference, so this is
    essentially inference speedup. Noted in the paper.
+7. **Nested BLAS threads.** If a BLAS-compiled binary runs with
+   `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, or `VECLIB_MAXIMUM_THREADS`
+   greater than 1, every outer KNN worker can create its own inner BLAS team.
+   The documented benchmark path pins BLAS to one internal thread and lets our
+   OpenMP/pthread layer own query-level parallelism.
 
 ---
 
@@ -401,6 +452,9 @@ On USC CARC (from src/cpp/knn/):
 cd src/cpp/knn && sbatch job_knn.sl
 # outputs to knnjob.out
 # compiles knn.cpp, runs ./knn ../../../data/train_cleaned.csv ../../../data/test_cleaned.csv
+
+# Optional OpenBLAS counterfactual:
+USE_KNN_BLAS=1 sbatch job_knn.sl
 ```
 
 CLI:
@@ -409,6 +463,8 @@ CLI:
 ./knn [train_csv] [test_csv] [k]
 # defaults: data/train_cleaned.csv  data/test_cleaned.csv  11
 # env var N_THREADS overrides the default 8 (used by the sweep harness)
+# env var KNN_BACKEND=blocked forces pure C++ when the binary was built with BLAS
+# env var KNN_BLAS_BLOCK overrides the default 256-query SGEMM panel
 ```
 
 Locally (macOS), from the repo root:
@@ -423,11 +479,25 @@ clang++ -std=c++17 -O3 -march=native \
 # Option B: Homebrew GCC (matches CARC's g++ exactly)
 brew install gcc
 g++-14 -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
+
+# Option C: macOS Accelerate BLAS backend
+clang++ -std=c++17 -O3 -DKNN_USE_BLAS \
+  src/cpp/knn/knn.cpp -o knn -lpthread -framework Accelerate
+VECLIB_MAXIMUM_THREADS=1 N_THREADS=8 ./knn data/train_cleaned.csv data/test_cleaned.csv
+
+# Option D: Linux/OpenBLAS backend
+g++ -std=c++17 -O3 -march=native -fopenmp -DKNN_USE_BLAS \
+  src/cpp/knn/knn.cpp -o knn -lpthread -lopenblas
+OPENBLAS_NUM_THREADS=1 N_THREADS=8 ./knn data/train_cleaned.csv data/test_cleaned.csv
 ```
 
-**Apple Clang alone will not work** — no OpenMP runtime. `pthread_barrier_t`
-isn't used by KNN itself (no sync needed) but the build flags are shared
-across the five algorithms.
+For Intel oneMKL, compile with `-DKNN_USE_MKL` and the oneMKL link line for the
+active compiler/runtime. The source includes `mkl.h` under that macro and uses
+the same CBLAS `sgemm` call.
+
+Apple Clang without `libomp` still builds KNN's serial and pthread paths, but
+the OMP predictor falls back to the serial range path because `_OPENMP` is not
+defined. Use Homebrew `libomp` when the OMP number matters.
 
 ### Verification expected
 
@@ -438,6 +508,9 @@ across the five algorithms.
   scheduling order because each query block scans training rows in a fixed
   order and writes a disjoint output slice.
 - **Speedup**: inference-only. Target 5–7× at 8 cores.
+- **BLAS counterfactual**: with BLAS internal threads pinned to 1, the pthread
+  path should be substantially faster than the blocked-dot backend. Local
+  Accelerate timing is 0.592 s for pthread inference on the full test split.
 
 ---
 
@@ -451,11 +524,12 @@ Append one row per CARC run.
 
 ### Local optimization checks (not CARC-comparable)
 
-| date | implementation | machine | pthreads infer (s) | accuracy | notes |
-|------|----------------|---------|-------------------:|:--------:|-------|
+| date | implementation | machine | infer (s) | accuracy | notes |
+|------|----------------|---------|----------:|:--------:|-------|
 | 2026-04-21 | old direct loop | Eric's MacBook Pro / 8 pthreads | 24.35 | 0.8104 | Targeted harness calling only `predict_parallel_pthreads`; Apple Clang/Xcode SDK build. |
-| 2026-04-21 | blocked dot-product loop | Eric's MacBook Pro / 8 pthreads | 7.83 | 0.8104 | Current repo implementation; ~3.1× faster than old direct loop locally, still behind local sklearn brute (~1.64 s). |
-| 2026-04-21 | temporary Accelerate BLAS prototype | Eric's MacBook Pro | 1.78 | 0.8102 | Not committed; shows vendor BLAS closes almost all of the sklearn gap. |
+| 2026-04-21 | blocked dot-product loop | Eric's MacBook Pro / 8 pthreads | 7.83 | 0.8104 | Pure C++ backend; ~3.1× faster than old direct loop locally, still behind local sklearn brute (~1.64 s). |
+| 2026-04-21 | committed BLAS SGEMM backend | Eric's MacBook Pro / 8 pthreads + Accelerate internal threads pinned to 1 | 0.592 | 0.8101 | `KNN_USE_BLAS`, `backend=blas-sgemm`, `KNN_BLAS_BLOCK=256`; serial/OMP/pthreads accuracy parity all 0.0000. |
+| 2026-04-21 | sklearn brute reference | Eric's MacBook Pro / `n_jobs=8`, Accelerate internal threads pinned to 1 | 1.586 | 0.8106 | Same local data loader and `KNeighborsClassifier(algorithm="brute", metric="euclidean")`; included only as a same-machine reference. |
 
 ---
 
@@ -468,11 +542,10 @@ Append one row per CARC run.
   has 96–128. Running T ∈ {16, 32, 64} would confirm whether memory
   bandwidth bites at 16 or 32 threads (predicted: 15–25× at T=64, not
   linear 50×). Publish the full Amdahl/Gustafson curve.
-- **Vendor-BLAS KNN** — the temporary Accelerate prototype is already close to
-  sklearn locally. A portable version could use OpenBLAS/MKL on CARC and would
-  likely close or reverse the KNN row, but it changes the claim from
-  "from-scratch C++17" to "C++ orchestration plus a vendor GEMM kernel."
-  Deferred unless the paper explicitly wants that counterfactual.
+- **CARC BLAS sweep** — the portable `KNN_USE_BLAS` path is implemented, but
+  the reported paper row should only change after a CARC OpenBLAS/MKL sweep.
+  Use `USE_KNN_BLAS=1 sbatch slurm/job_sweep.sl`, with BLAS internal threads
+  pinned to 1, to measure whether the local Accelerate win holds on the cluster.
 - **Partial sort / approximate KNN** — for k=11 out of n_rows=98K, a
   priority-queue-based selection (Dutch-national-flag / introselect) would
   shave the per-query constant but doesn't change complexity.

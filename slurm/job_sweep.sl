@@ -18,7 +18,7 @@ module load gcc/13.3.0
 #   - sweep_results_sklearn.csv (sklearn + XGBoost side, from compare.py)
 # one row per (algorithm, variant, n_threads).
 #
-# Run from the repo root: `sbatch job_sweep.sl`.
+# Run from the repo root: `sbatch slurm/job_sweep.sl`.
 # ----------------------------------------------------------------------------
 
 THREAD_COUNTS=(1 2 4 8)
@@ -27,7 +27,14 @@ mkdir -p src/sklearn_xgb/logs
 
 # Compile all five C++ binaries + analytics_engine once (same flags everywhere).
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/svm/svm.cpp -o svm -lpthread
-g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
+if [[ "${USE_KNN_BLAS:-0}" == "1" ]]; then
+    module load openblas 2>/dev/null || true
+    : "${KNN_BLAS_CFLAGS:=-DKNN_USE_BLAS}"
+    : "${KNN_BLAS_LIBS:=-lopenblas}"
+    g++ -std=c++17 -O3 -march=native -fopenmp $KNN_BLAS_CFLAGS src/cpp/knn/knn.cpp -o knn -lpthread $KNN_BLAS_LIBS
+else
+    g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
+fi
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/dt/dt.cpp   -o dt  -lpthread
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/nb/nb.cpp   -o nb  -lpthread
@@ -43,10 +50,18 @@ rm -f src/sklearn_xgb/results.csv src/sklearn_xgb/results.json
 # ----------------------------------------------------------------------------
 for T in "${THREAD_COUNTS[@]}"; do
     echo "=== C++ sweep: N_THREADS=$T ==="
-    N_THREADS=$T ./analytics_engine \
-        data/train_cleaned.csv \
-        data/test_cleaned.csv \
-        "analytics_results_t${T}.csv"
+    if [[ "${USE_KNN_BLAS:-0}" == "1" ]]; then
+        OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+            N_THREADS=$T ./analytics_engine \
+            data/train_cleaned.csv \
+            data/test_cleaned.csv \
+            "analytics_results_t${T}.csv"
+    else
+        N_THREADS=$T ./analytics_engine \
+            data/train_cleaned.csv \
+            data/test_cleaned.csv \
+            "analytics_results_t${T}.csv"
+    fi
 done
 
 # Merge: keep header from the first file, skip headers from the rest.
