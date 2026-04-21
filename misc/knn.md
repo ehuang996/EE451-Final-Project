@@ -132,6 +132,35 @@ For outer-parallel BLAS runs, cap the vendor library to one internal thread
 Otherwise each of our worker threads can spawn its own BLAS thread team and
 oversubscribe the node.
 
+### Backend selection model
+
+The file now supports two exact KNN backends behind the same public predictor
+entry points:
+
+| Build mode | Default runtime backend | Inner kernel | Dependency | Intended use |
+|------------|-------------------------|--------------|------------|--------------|
+| no BLAS macro | `blocked-dot` | hand-written blocked dot-product loop | C++17 + pthreads/OpenMP | original project comparison / from-scratch baseline |
+| `-DKNN_USE_BLAS` | `blas-sgemm` | CBLAS `sgemm` for dot-product panels | OpenBLAS, Accelerate, or generic CBLAS | sklearn counterfactual |
+| `-DKNN_USE_MKL` | `blas-sgemm` | CBLAS `sgemm` via oneMKL | Intel oneMKL | cluster/vendor-BLAS run |
+
+Compile-time macros only decide whether the binary has access to CBLAS:
+
+```cpp
+#if defined(KNN_USE_MKL)
+    #include <mkl.h>
+#elif defined(KNN_USE_ACCELERATE) || (defined(KNN_USE_BLAS) && defined(__APPLE__))
+    #include <Accelerate/Accelerate.h>
+#elif defined(KNN_USE_BLAS) || defined(KNN_USE_OPENBLAS) || defined(KNN_USE_CBLAS)
+    #include <cblas.h>
+#endif
+```
+
+Runtime selection is deliberately separate. A BLAS-compiled binary defaults to
+`blas-sgemm`, but `KNN_BACKEND=blocked` switches back to the pure C++ path
+without recompiling. This is useful for apples-to-apples A/B timing because the
+data loader, normalization, model setup, metrics, and command-line handling are
+identical across both runs.
+
 ---
 
 ## 4. Data structures & memory layout
@@ -308,7 +337,52 @@ embarrassingly-parallel workload.
 
 ### 6d. Optional BLAS backend
 
-When `KNN_USE_BLAS` is defined, the prediction entry points dispatch to:
+The BLAS backend is still exact brute-force KNN. It does **not** change the
+model, the distance metric, the k-neighbor voting rule, or the output labels.
+It only replaces the hottest arithmetic subproblem:
+
+```text
+for each query q:
+    for each train row i:
+        dot[q, i] = sum_j X_test[q, j] * X_train[i, j]
+```
+
+with one dense matrix multiply over a query panel:
+
+```text
+dots = X_test[q_begin:q_end, :] @ X_train.T
+```
+
+Then the code converts those dot products into squared distances and runs the
+same k-selection/voting logic as the pure C++ backend.
+
+#### Dataflow
+
+Training stores the normalized training matrix row-major in `model.X` and
+precomputes one squared norm per training row in `model.norm2`:
+
+```text
+model.X      shape: n_train × n_features
+model.norm2  shape: n_train
+model.y      shape: n_train
+```
+
+Prediction first computes `test_norm2` for all test rows. The BLAS path then
+walks the query range in panels of `KNN_BLAS_BLOCK` rows. For each panel:
+
+1. Call `sgemm` to compute all query/train dot products for the panel.
+2. For each query row in the panel, scan the corresponding `dots[q, :]` row.
+3. Convert dot products to squared distances:
+   `d² = test_norm2[q] + model.norm2[i] - 2 * dots[q, i]`.
+4. Maintain the k best candidates with the existing O(k) replacement scan.
+5. Finalize the majority vote for each query and write directly into `pred`.
+
+No full `n_test × n_train` distance matrix is materialized. Only one panel of
+dot products exists per worker.
+
+#### SGEMM layout
+
+The C++ arrays are row-major, so the call is:
 
 ```cpp
 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -318,18 +392,103 @@ cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
             0.0f, dots, n_train);
 ```
 
-Then the same top-k scan evaluates
-`d² = test_norm2[q] + train_norm2[i] - 2 * dots[q, i]`. The BLAS backend keeps
-exact brute-force KNN semantics; it only replaces the dot-product inner kernel.
+That means:
 
-The important scheduling choice is nested parallelism. For the fastest local
-path, BLAS is pinned to one internal thread and our pthreads split the query
-range across workers. That gives vendor-quality SGEMM microkernels inside each
-worker without creating `N_THREADS × BLAS_THREADS` runnable threads.
+| SGEMM operand | Logical matrix | Shape | Transpose flag | Leading dimension |
+|---------------|----------------|------:|----------------|------------------:|
+| A | `X_test_block` | `q_count × n_features` | `NoTrans` | `n_features` |
+| B | `model.X` | `n_train × n_features` | `Trans` | `n_features` |
+| C | `dots` | `q_count × n_train` | output | `n_train` |
+
+The output row `dots[q, :]` contains all training-set dot products for one test
+query, which makes the subsequent top-k scan linear and cache-friendly.
+
+#### What stays outside BLAS
+
+BLAS only handles the dot-product panel. The following work remains in our C++
+implementation:
+
+- CSV loading, feature normalization, and binary/one-hot skip logic.
+- Training-set copy and `norm2` precomputation.
+- Test-row norm computation.
+- Conversion from dot product to squared-L2 distance.
+- Top-k maintenance for `k=11`.
+- Majority vote and nearest-neighbor tie break.
+- Serial, OpenMP, and pthread query scheduling.
+
+This split is intentional. BLAS is excellent at dense multiply-add panels, but
+not at irregular top-k selection with labels. Keeping top-k outside BLAS avoids
+materializing or sorting a giant full distance matrix.
+
+#### Threading strategy
+
+There are two possible places to parallelize a BLAS-backed KNN:
+
+1. Inside BLAS, where `sgemm` itself uses multiple threads.
+2. Outside BLAS, where our KNN code splits query ranges across workers and each
+   worker calls single-threaded `sgemm`.
+
+The implemented benchmark path uses option 2. For pthreads, each worker gets a
+static slice of test queries, allocates its own dot buffer, and repeatedly calls
+`predict_blas_range` on that slice. The BLAS library is pinned to one internal
+thread:
+
+```bash
+OPENBLAS_NUM_THREADS=1
+MKL_NUM_THREADS=1
+VECLIB_MAXIMUM_THREADS=1
+```
+
+This prevents nested oversubscription. Without those caps, an 8-thread KNN run
+could become 8 outer workers × 8 BLAS workers = 64 runnable compute threads,
+which usually loses to scheduler overhead and cache pressure.
+
+#### Why this can beat sklearn locally
+
+Sklearn is not serial in our comparison. The Python harness passes
+`n_jobs=N_THREADS`, and sklearn's brute Euclidean path uses optimized compiled
+distance reductions. The reason the new path can still win locally is that it
+is narrower and more explicit for this exact benchmark:
+
+- The inner dot-product kernel is now vendor SGEMM, so the old hand-loop
+  disadvantage is gone.
+- The outer query partitioning is fixed and simple: one pthread worker owns a
+  contiguous query slice and writes disjoint prediction indices.
+- BLAS internal threading is pinned to 1, so the only parallel layer is the one
+  we control.
+- The code immediately reduces each dot panel into k nearest labels instead of
+  routing through a more general estimator API.
+
+The correct claim is therefore not "raw C++ loops beat sklearn." The accurate
+claim is: **pure C++ remains the from-scratch baseline; the optional BLAS path
+uses the same vendor-grade inner-kernel idea as sklearn while keeping a lean,
+explicit outer schedule for this workload.**
+
+#### Memory and block-size tradeoff
+
+`KNN_BLAS_BLOCK` controls the number of test queries per SGEMM panel. The dot
+buffer size per worker is:
+
+```text
+KNN_BLAS_BLOCK × n_train × sizeof(float)
+```
+
+At the default block size:
+
+```text
+256 × 97,929 × 4 B ≈ 96 MB per worker
+```
+
+With 8 pthread workers, the transient dot buffers are roughly 770 MB total.
+Larger blocks usually improve SGEMM efficiency because the matrix multiply has
+more work per call, but they also increase memory pressure. Smaller blocks
+reduce memory footprint but may underfeed the vendor kernel. The current
+default is a pragmatic local choice, not a universal optimum; CARC/OpenBLAS or
+MKL should be swept before claiming a cluster-wide result.
 
 ### Cost model per query
 
-For each query block, `predict_query_block` touches:
+For each pure-C++ query block, `predict_query_block` touches:
 - `n_rows × n_features × 4 B = 98K × 103 × 4 ≈ 40 MB` of `X_train`, streamed
   once and reused across up to 16 test queries.
 - `QUERY_BLOCK × n_features × 4 B ≈ 6.6 KB` of transposed query data in `qbuf`
