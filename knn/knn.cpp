@@ -29,6 +29,7 @@ using Labels = std::vector<int>;
 
 struct Dataset {
     int n_features = 0;
+    std::vector<std::string> feature_names;
     std::vector<float> X_train;  // row-major: n_train x n_features
     std::vector<float> X_test;   // row-major: n_test x n_features
     Labels y_train;
@@ -68,6 +69,22 @@ static std::string resolve_path(const std::string& path) {
     const std::string alt = "../" + path;
     if (std::filesystem::exists(alt)) return alt;
     return path;
+}
+
+static bool has_prefix(const std::string& s, const std::string& prefix) {
+    return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+static bool is_one_hot_feature(const std::string& feature_name) {
+    return has_prefix(feature_name, "map_");
+}
+
+static bool is_explicit_binary_indicator(const std::string& feature_name) {
+    return feature_name == "bomb_planted";
+}
+
+static bool is_binary_01_value(double v) {
+    return std::abs(v) < 1e-9 || std::abs(v - 1.0) < 1e-9;
 }
 
 static int parse_int_or_default(const char* raw, int fallback, const char* name) {
@@ -151,6 +168,11 @@ static Dataset load_dataset(const std::string& train_path_in,
     }
 
     ds.n_features = static_cast<int>(cols.size()) - 1;
+    ds.feature_names.reserve(ds.n_features);
+    for (int i = 0; i < static_cast<int>(cols.size()); ++i) {
+        if (i == label_col) continue;
+        ds.feature_names.push_back(cols[i]);
+    }
     train_file.close();
 
     load_csv_rows(train_path, label_col, ds.n_features, ds.X_train, ds.y_train);
@@ -159,23 +181,53 @@ static Dataset load_dataset(const std::string& train_path_in,
     const int n_train = static_cast<int>(ds.y_train.size());
     const int n_test = static_cast<int>(ds.y_test.size());
 
+    std::vector<unsigned char> skip_normalize(ds.n_features, 0);
+    for (int j = 0; j < ds.n_features; ++j) {
+        bool skip = is_one_hot_feature(ds.feature_names[j]) ||
+                    is_explicit_binary_indicator(ds.feature_names[j]);
+        if (!skip) {
+            bool binary_01 = true;
+            for (int i = 0; i < n_train; ++i) {
+                const float* row = &ds.X_train[static_cast<size_t>(i) * ds.n_features];
+                if (!is_binary_01_value(static_cast<double>(row[j]))) {
+                    binary_01 = false;
+                    break;
+                }
+            }
+            if (binary_01) skip = true;
+        }
+        skip_normalize[j] = static_cast<unsigned char>(skip);
+    }
+
     std::vector<double> mean(ds.n_features, 0.0);
     std::vector<double> sd(ds.n_features, 0.0);
 
     for (int i = 0; i < n_train; ++i) {
         const float* row = &ds.X_train[static_cast<size_t>(i) * ds.n_features];
-        for (int j = 0; j < ds.n_features; ++j) mean[j] += row[j];
+        for (int j = 0; j < ds.n_features; ++j) {
+            if (skip_normalize[j]) continue;
+            mean[j] += row[j];
+        }
     }
-    for (int j = 0; j < ds.n_features; ++j) mean[j] /= n_train;
+    for (int j = 0; j < ds.n_features; ++j) {
+        if (skip_normalize[j]) continue;
+        mean[j] /= n_train;
+    }
 
     for (int i = 0; i < n_train; ++i) {
         const float* row = &ds.X_train[static_cast<size_t>(i) * ds.n_features];
         for (int j = 0; j < ds.n_features; ++j) {
+            if (skip_normalize[j]) continue;
             const double d = static_cast<double>(row[j]) - mean[j];
             sd[j] += d * d;
         }
     }
     for (int j = 0; j < ds.n_features; ++j) {
+        if (skip_normalize[j]) {
+            mean[j] = 0.0;
+            sd[j] = 1.0;
+            continue;
+        }
         sd[j] = std::sqrt(sd[j] / n_train);
         if (sd[j] < 1e-9) sd[j] = 1.0;
     }
