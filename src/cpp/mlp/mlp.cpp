@@ -4,8 +4,6 @@
 // Dataset  : train_cleaned.csv / test_cleaned.csv
 // Label    : round_winner in {+1, -1}
 // =============================================================================
-// Pure C++:
-//   g++ -std=c++17 -O3 -march=native -fopenmp mlp.cpp -o mlp -lpthread
 // OpenBLAS:
 //   g++ -std=c++17 -O3 -march=native -fopenmp -DMLP_USE_BLAS mlp.cpp -o mlp -lpthread -lopenblas
 // MKL:
@@ -38,60 +36,6 @@
 #include <omp.h>
 #endif
 
-#if defined(__APPLE__)
-#ifndef PTHREAD_BARRIER_SERIAL_THREAD
-#define PTHREAD_BARRIER_SERIAL_THREAD 1
-#endif
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t  cond;
-    unsigned        count;
-    unsigned        waiting;
-    unsigned        generation;
-} pthread_barrier_t;
-
-static int pthread_barrier_init(pthread_barrier_t* barrier,
-                                const void*,
-                                unsigned count) {
-    if (!barrier || count == 0) return -1;
-    if (pthread_mutex_init(&barrier->mutex, nullptr) != 0) return -1;
-    if (pthread_cond_init(&barrier->cond, nullptr) != 0) {
-        pthread_mutex_destroy(&barrier->mutex);
-        return -1;
-    }
-    barrier->count = count;
-    barrier->waiting = 0;
-    barrier->generation = 0;
-    return 0;
-}
-
-static int pthread_barrier_destroy(pthread_barrier_t* barrier) {
-    if (!barrier) return -1;
-    pthread_cond_destroy(&barrier->cond);
-    pthread_mutex_destroy(&barrier->mutex);
-    return 0;
-}
-
-static int pthread_barrier_wait(pthread_barrier_t* barrier) {
-    if (!barrier) return -1;
-    pthread_mutex_lock(&barrier->mutex);
-    const unsigned generation = barrier->generation;
-    barrier->waiting++;
-    if (barrier->waiting == barrier->count) {
-        barrier->waiting = 0;
-        barrier->generation++;
-        pthread_cond_broadcast(&barrier->cond);
-        pthread_mutex_unlock(&barrier->mutex);
-        return PTHREAD_BARRIER_SERIAL_THREAD;
-    }
-    while (generation == barrier->generation) {
-        pthread_cond_wait(&barrier->cond, &barrier->mutex);
-    }
-    pthread_mutex_unlock(&barrier->mutex);
-    return 0;
-}
-#endif
-
 #if defined(MLP_USE_MKL)
 #include <mkl.h>
 #define MLP_HAS_CBLAS 1
@@ -103,6 +47,10 @@ static int pthread_barrier_wait(pthread_barrier_t* barrier) {
 #define MLP_HAS_CBLAS 1
 #else
 #define MLP_HAS_CBLAS 0
+#endif
+
+#if !MLP_HAS_CBLAS
+#error "MLP now requires a BLAS backend. Compile with -DMLP_USE_BLAS, -DMLP_USE_MKL, or the platform equivalent."
 #endif
 
 // -----------------------------------------------------------------------------
@@ -119,14 +67,6 @@ static constexpr double MOMENTUM   = 0.9;   // Polyak momentum
 static int              N_THREADS  = 8;     // overridable via N_THREADS env var (read in main)
 static constexpr int    SEED       = 42;    // RNG seed
 static int              BLAS_PRED_BLOCK = 512;  // overridable via MLP_BLAS_BLOCK env var
-#if MLP_HAS_CBLAS
-static bool             USE_BLAS_BACKEND = true;   // overridable via MLP_BACKEND=loop
-#else
-static bool             USE_BLAS_BACKEND = false;
-#endif
-
-// BATCH % N_THREADS == 0 is required only by the sample-loop pthreads trainer.
-// The BLAS backend routes training through the batch-GEMM path instead.
 
 using Labels = std::vector<int>;
 
@@ -182,11 +122,7 @@ static const char* blas_provider_name() {
 }
 
 static const char* active_backend_name() {
-#if MLP_HAS_CBLAS
-    return USE_BLAS_BACKEND ? "blas-batch" : "sample-loop";
-#else
-    return "sample-loop";
-#endif
+    return "blas-batch";
 }
 
 // -----------------------------------------------------------------------------
@@ -458,68 +394,6 @@ static void init_weights(MLPModel& m, int n_features, unsigned seed) {
     for (auto& w : m.W1) w = he1(rng);
     for (auto& w : m.W2) w = he2(rng);
     for (auto& w : m.W3) w = out_u(rng);
-}
-
-// -----------------------------------------------------------------------------
-// Forward and backward (single sample over a row of flat float X)
-// -----------------------------------------------------------------------------
-static inline void forward_sample(const MLPModel& m, const float* x, int n_features,
-                                  double* a1, double* a2,
-                                  double& z_out, double& yhat) {
-    for (int i = 0; i < H1; ++i) {
-        double s = m.b1[i];
-        const double* wr = m.W1.data() + static_cast<size_t>(i) * n_features;
-        for (int j = 0; j < n_features; ++j) s += wr[j] * static_cast<double>(x[j]);
-        a1[i] = (s > 0.0) ? s : 0.0;
-    }
-    for (int i = 0; i < H2; ++i) {
-        double s = m.b2[i];
-        const double* wr = m.W2.data() + static_cast<size_t>(i) * H1;
-        for (int j = 0; j < H1; ++j) s += wr[j] * a1[j];
-        a2[i] = (s > 0.0) ? s : 0.0;
-    }
-    double z = m.b3[0];
-    const double* wr = m.W3.data();   // OUT == 1
-    for (int j = 0; j < H2; ++j) z += wr[j] * a2[j];
-    z_out = z;
-    yhat  = sigmoid(z);
-}
-
-// Uses fused sigmoid+BCE derivative: dL/dz = yhat - t.
-static inline void backward_sample(const MLPModel& m, const float* x, int n_features,
-                                   const double* a1, const double* a2,
-                                   double yhat, int t,
-                                   double* gW1, double* gb1,
-                                   double* gW2, double* gb2,
-                                   double* gW3, double* gb3) {
-    double dz3 = yhat - static_cast<double>(t);
-    for (int j = 0; j < H2; ++j) gW3[j] += dz3 * a2[j];
-    gb3[0] += dz3;
-
-    double dz2[H2];
-    for (int j = 0; j < H2; ++j) {
-        double da = m.W3[j] * dz3;
-        dz2[j] = (a2[j] > 0.0) ? da : 0.0;
-    }
-    for (int i = 0; i < H2; ++i) {
-        double* gw_row = gW2 + static_cast<size_t>(i) * H1;
-        double v = dz2[i];
-        for (int j = 0; j < H1; ++j) gw_row[j] += v * a1[j];
-        gb2[i] += v;
-    }
-
-    double dz1[H1];
-    for (int j = 0; j < H1; ++j) {
-        double da = 0.0;
-        for (int i = 0; i < H2; ++i) da += m.W2[static_cast<size_t>(i) * H1 + j] * dz2[i];
-        dz1[j] = (a1[j] > 0.0) ? da : 0.0;
-    }
-    for (int i = 0; i < H1; ++i) {
-        double* gw_row = gW1 + static_cast<size_t>(i) * n_features;
-        double v = dz1[i];
-        for (int j = 0; j < n_features; ++j) gw_row[j] += v * static_cast<double>(x[j]);
-        gb1[i] += v;
-    }
 }
 
 // SGD + Polyak momentum + L2 decay on weights (not biases)
@@ -833,37 +707,14 @@ static Labels predict_serial(const MLPModel& m,
                              const std::vector<float>& X,
                              int n_rows,
                              int n_features) {
-#if MLP_HAS_CBLAS
-    if (USE_BLAS_BACKEND) return predict_serial_blas(m, X, n_rows, n_features);
-#endif
-    Labels out(n_rows);
-    for (int i = 0; i < n_rows; ++i) {
-        const float* xi = &X[static_cast<size_t>(i) * n_features];
-        double a1[H1], a2[H2], z, yhat;
-        forward_sample(m, xi, n_features, a1, a2, z, yhat);
-        out[i] = (yhat >= 0.5) ? 1 : -1;
-    }
-    return out;
+    return predict_serial_blas(m, X, n_rows, n_features);
 }
 
 static Labels predict_parallel(const MLPModel& m,
                                const std::vector<float>& X,
                                int n_rows,
                                int n_features) {
-#if MLP_HAS_CBLAS
-    if (USE_BLAS_BACKEND) return predict_parallel_blas(m, X, n_rows, n_features);
-#endif
-    Labels out(n_rows);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(N_THREADS)
-#endif
-    for (int i = 0; i < n_rows; ++i) {
-        const float* xi = &X[static_cast<size_t>(i) * n_features];
-        double a1[H1], a2[H2], z, yhat;
-        forward_sample(m, xi, n_features, a1, a2, z, yhat);
-        out[i] = (yhat >= 0.5) ? 1 : -1;
-    }
-    return out;
+    return predict_parallel_blas(m, X, n_rows, n_features);
 }
 
 // -----------------------------------------------------------------------------
@@ -887,8 +738,7 @@ static Metrics evaluate(const Labels& truth, const Labels& pred) {
 
 // -----------------------------------------------------------------------------
 // Training - Serial (mini-batch SGD + Polyak momentum + decaying LR)
-//   This is the single serial baseline; the parallel variants parallelize
-//   the same algorithm (no extra "better_serial" tier like the old MLP had).
+//   BLAS-only backend.
 // -----------------------------------------------------------------------------
 static MLPModel train_serial(const std::vector<float>& X,
                              const Labels& y,
@@ -897,66 +747,13 @@ static MLPModel train_serial(const std::vector<float>& X,
                              int epochs,
                              double lr,
                              double lambda) {
-#if MLP_HAS_CBLAS
-    if (USE_BLAS_BACKEND) return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
-#endif
-    MLPModel model;
-    init_weights(model, n_features, SEED);
-    if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
-
-    std::vector<int> idx(n_rows);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::mt19937 rng(SEED);
-
-    std::vector<double> gW1(H1  * n_features), gb1(H1);
-    std::vector<double> gW2(H2  * H1),         gb2(H2);
-    std::vector<double> gW3(OUT * H2),         gb3(OUT);
-
-    const int n_batches = n_rows / BATCH;
-
-    for (int e = 0; e < epochs; ++e) {
-        std::shuffle(idx.begin(), idx.end(), rng);
-        const double lr_t = lr / std::sqrt(static_cast<double>(e + 1));
-        double epoch_loss = 0.0;
-
-        for (int bi = 0; bi < n_batches; ++bi) {
-            const int bs = bi * BATCH;
-            std::fill(gW1.begin(), gW1.end(), 0.0);
-            std::fill(gb1.begin(), gb1.end(), 0.0);
-            std::fill(gW2.begin(), gW2.end(), 0.0);
-            std::fill(gb2.begin(), gb2.end(), 0.0);
-            std::fill(gW3.begin(), gW3.end(), 0.0);
-            std::fill(gb3.begin(), gb3.end(), 0.0);
-
-            for (int i = 0; i < BATCH; ++i) {
-                const int s = idx[bs + i];
-                const int t = (y[s] == 1) ? 1 : 0;
-                const float* xs = &X[static_cast<size_t>(s) * n_features];
-                double a1[H1], a2[H2], z, yhat;
-                forward_sample(model, xs, n_features, a1, a2, z, yhat);
-                epoch_loss += bce_loss(z, t);
-                backward_sample(model, xs, n_features, a1, a2, yhat, t,
-                                gW1.data(), gb1.data(),
-                                gW2.data(), gb2.data(),
-                                gW3.data(), gb3.data());
-            }
-
-            sgd_momentum_update(model, gW1, gb1, gW2, gb2, gW3, gb3,
-                                lambda, lr_t, BATCH);
-        }
-
-        std::cout << "epoch " << e << "  lr=" << lr_t << "  loss="
-                  << (epoch_loss / static_cast<double>(n_batches * BATCH)) << "\n";
-    }
-    return model;
+    return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
 }
 
 // -----------------------------------------------------------------------------
-// Training - Parallel (OpenMP, per-thread gradient buffers + serial reduction)
-//   Same pattern as svm.cpp train_parallel: no critical section, no mutex.
-//   #pragma omp parallel for dispatches mini-batch samples; each thread
-//   accumulates into its own gradient buffer (indexed by tid); the primary
-//   thread then serially reduces across threads and applies the SGD update.
+// Training - Parallel (OpenMP)
+//   The BLAS batch kernel is already the right granularity for this network, so
+//   the OpenMP / pthread entry points intentionally reuse the same trainer.
 // -----------------------------------------------------------------------------
 static MLPModel train_parallel_omp(const std::vector<float>& X,
                                    const Labels& y,
@@ -965,232 +762,12 @@ static MLPModel train_parallel_omp(const std::vector<float>& X,
                                    int epochs,
                                    double lr,
                                    double lambda) {
-#if MLP_HAS_CBLAS
-    // For this 128-row mini-batch regime, slicing the batch across outer
-    // threads leaves each worker with panels that are too small to amortize
-    // BLAS call overhead. Reuse the batch-GEMM trainer instead.
-    if (USE_BLAS_BACKEND) return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
-#endif
-    MLPModel model;
-    init_weights(model, n_features, SEED);
-    if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
-
-    std::vector<int> idx(n_rows);
-    std::iota(idx.begin(), idx.end(), 0);
-    std::mt19937 rng(SEED);
-
-    std::vector<double> gW1(H1  * n_features), gb1(H1);
-    std::vector<double> gW2(H2  * H1),         gb2(H2);
-    std::vector<double> gW3(OUT * H2),         gb3(OUT);
-
-    // Per-thread gradient buffers (allocated once per trainer call)
-    std::vector<std::vector<double>> lgW1(N_THREADS, std::vector<double>(H1  * n_features));
-    std::vector<std::vector<double>> lgb1(N_THREADS, std::vector<double>(H1));
-    std::vector<std::vector<double>> lgW2(N_THREADS, std::vector<double>(H2  * H1));
-    std::vector<std::vector<double>> lgb2(N_THREADS, std::vector<double>(H2));
-    std::vector<std::vector<double>> lgW3(N_THREADS, std::vector<double>(OUT * H2));
-    std::vector<std::vector<double>> lgb3(N_THREADS, std::vector<double>(OUT));
-    std::vector<double> lloss(N_THREADS, 0.0);
-
-    const int n_batches = n_rows / BATCH;
-
-    for (int e = 0; e < epochs; ++e) {
-        std::shuffle(idx.begin(), idx.end(), rng);
-        const double lr_t = lr / std::sqrt(static_cast<double>(e + 1));
-        double epoch_loss = 0.0;
-
-        for (int bi = 0; bi < n_batches; ++bi) {
-            const int bs = bi * BATCH;
-
-            for (int t = 0; t < N_THREADS; ++t) {
-                std::fill(lgW1[t].begin(), lgW1[t].end(), 0.0);
-                std::fill(lgb1[t].begin(), lgb1[t].end(), 0.0);
-                std::fill(lgW2[t].begin(), lgW2[t].end(), 0.0);
-                std::fill(lgb2[t].begin(), lgb2[t].end(), 0.0);
-                std::fill(lgW3[t].begin(), lgW3[t].end(), 0.0);
-                std::fill(lgb3[t].begin(), lgb3[t].end(), 0.0);
-                lloss[t] = 0.0;
-            }
-
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(N_THREADS)
-#endif
-            for (int i = 0; i < BATCH; ++i) {
-                int tid = 0;
-#ifdef _OPENMP
-                tid = omp_get_thread_num();
-#endif
-                const int s = idx[bs + i];
-                const int t = (y[s] == 1) ? 1 : 0;
-                const float* xs = &X[static_cast<size_t>(s) * n_features];
-                double a1[H1], a2[H2], z, yhat;
-                forward_sample(model, xs, n_features, a1, a2, z, yhat);
-                lloss[tid] += bce_loss(z, t);
-                backward_sample(model, xs, n_features, a1, a2, yhat, t,
-                                lgW1[tid].data(), lgb1[tid].data(),
-                                lgW2[tid].data(), lgb2[tid].data(),
-                                lgW3[tid].data(), lgb3[tid].data());
-            }
-
-            // Serial reduction (same pattern as svm.cpp train_parallel)
-            std::fill(gW1.begin(), gW1.end(), 0.0);
-            std::fill(gb1.begin(), gb1.end(), 0.0);
-            std::fill(gW2.begin(), gW2.end(), 0.0);
-            std::fill(gb2.begin(), gb2.end(), 0.0);
-            std::fill(gW3.begin(), gW3.end(), 0.0);
-            std::fill(gb3.begin(), gb3.end(), 0.0);
-            for (int t = 0; t < N_THREADS; ++t) {
-                for (size_t k = 0; k < gW1.size(); ++k) gW1[k] += lgW1[t][k];
-                for (size_t k = 0; k < gb1.size(); ++k) gb1[k] += lgb1[t][k];
-                for (size_t k = 0; k < gW2.size(); ++k) gW2[k] += lgW2[t][k];
-                for (size_t k = 0; k < gb2.size(); ++k) gb2[k] += lgb2[t][k];
-                for (size_t k = 0; k < gW3.size(); ++k) gW3[k] += lgW3[t][k];
-                for (size_t k = 0; k < gb3.size(); ++k) gb3[k] += lgb3[t][k];
-                epoch_loss += lloss[t];
-            }
-
-            sgd_momentum_update(model, gW1, gb1, gW2, gb2, gW3, gb3,
-                                lambda, lr_t, BATCH);
-        }
-
-        std::cout << "epoch " << e << "  lr=" << lr_t << "  loss="
-                  << (epoch_loss / static_cast<double>(n_batches * BATCH)) << "\n";
-    }
-    return model;
+    return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
 }
 
 // -----------------------------------------------------------------------------
-// Training - Parallel (pthreads, MLP-specific demonstration of fine-grained
-// synchronization). Mutex + two barriers per mini-batch. Kept alongside the
-// OpenMP variant so the writeup can compare two parallel implementations of
-// the same algorithm.
+// Training - Parallel (pthreads)
 // -----------------------------------------------------------------------------
-struct MLPParState {
-    const std::vector<float>* X;
-    const Labels*             y;
-    int                       n_rows;
-    int                       n_features;
-    MLPModel*                 model;
-    std::vector<int>          idx;
-    int                       batch_start;
-    double                    epoch_loss;
-    std::vector<double>       gW1, gb1, gW2, gb2, gW3, gb3;
-    double                    shared_loss;
-    double                    lr;
-    double                    lambda;
-    pthread_mutex_t           mutex;
-    pthread_barrier_t         barrier_acc;
-    pthread_barrier_t         barrier_upd;
-    unsigned                  seed;
-    int                       epochs;
-};
-
-struct MLPTArg {
-    MLPParState* st;
-    int          tid;
-};
-
-static void* mlp_pthread_worker(void* raw) {
-    auto*   a  = static_cast<MLPTArg*>(raw);
-    auto*   st = a->st;
-    const std::vector<float>& X = *st->X;
-    const Labels&             y = *st->y;
-    const int n_features = st->n_features;
-
-    std::vector<double> lgW1(H1  * n_features), lgb1(H1);
-    std::vector<double> lgW2(H2  * H1),         lgb2(H2);
-    std::vector<double> lgW3(OUT * H2),         lgb3(OUT);
-
-    const int slice = BATCH / N_THREADS;
-    const int s_off = a->tid * slice;
-    const int e_off = (a->tid == N_THREADS - 1) ? BATCH : (a->tid + 1) * slice;
-
-    const int n_batches = st->n_rows / BATCH;
-
-    for (int epoch = 0; epoch < st->epochs; ++epoch) {
-
-        // Epoch housekeeping: thread 0 reshuffles + resets counters
-        if (a->tid == 0) {
-            std::mt19937 rng(st->seed + static_cast<unsigned>(epoch));
-            std::shuffle(st->idx.begin(), st->idx.end(), rng);
-            st->batch_start = 0;
-            st->epoch_loss  = 0.0;
-        }
-        pthread_barrier_wait(&st->barrier_upd);
-
-        const double lr_t = st->lr / std::sqrt(static_cast<double>(epoch + 1));
-
-        for (int bi = 0; bi < n_batches; ++bi) {
-
-            // Step 1: local forward+backward on this thread's slice
-            std::fill(lgW1.begin(), lgW1.end(), 0.0);
-            std::fill(lgb1.begin(), lgb1.end(), 0.0);
-            std::fill(lgW2.begin(), lgW2.end(), 0.0);
-            std::fill(lgb2.begin(), lgb2.end(), 0.0);
-            std::fill(lgW3.begin(), lgW3.end(), 0.0);
-            std::fill(lgb3.begin(), lgb3.end(), 0.0);
-            double lloss = 0.0;
-
-            const int bs = st->batch_start;
-            for (int i = s_off; i < e_off; ++i) {
-                const int sample = st->idx[bs + i];
-                const int t = (y[sample] == 1) ? 1 : 0;
-                const float* xs = &X[static_cast<size_t>(sample) * n_features];
-                double a1[H1], a2[H2], z, yhat;
-                forward_sample(*st->model, xs, n_features, a1, a2, z, yhat);
-                lloss += bce_loss(z, t);
-                backward_sample(*st->model, xs, n_features, a1, a2, yhat, t,
-                                lgW1.data(), lgb1.data(),
-                                lgW2.data(), lgb2.data(),
-                                lgW3.data(), lgb3.data());
-            }
-
-            // Step 2: mutex-protected reduction
-            pthread_mutex_lock(&st->mutex);
-            for (size_t k = 0; k < st->gW1.size(); ++k) st->gW1[k] += lgW1[k];
-            for (size_t k = 0; k < st->gb1.size(); ++k) st->gb1[k] += lgb1[k];
-            for (size_t k = 0; k < st->gW2.size(); ++k) st->gW2[k] += lgW2[k];
-            for (size_t k = 0; k < st->gb2.size(); ++k) st->gb2[k] += lgb2[k];
-            for (size_t k = 0; k < st->gW3.size(); ++k) st->gW3[k] += lgW3[k];
-            for (size_t k = 0; k < st->gb3.size(); ++k) st->gb3[k] += lgb3[k];
-            st->shared_loss += lloss;
-            pthread_mutex_unlock(&st->mutex);
-
-            // Step 3: all threads have contributed
-            pthread_barrier_wait(&st->barrier_acc);
-
-            // Step 4: thread 0 applies update
-            if (a->tid == 0) {
-                sgd_momentum_update(*st->model,
-                                    st->gW1, st->gb1,
-                                    st->gW2, st->gb2,
-                                    st->gW3, st->gb3,
-                                    st->lambda, lr_t, BATCH);
-                st->epoch_loss += st->shared_loss;
-                std::fill(st->gW1.begin(), st->gW1.end(), 0.0);
-                std::fill(st->gb1.begin(), st->gb1.end(), 0.0);
-                std::fill(st->gW2.begin(), st->gW2.end(), 0.0);
-                std::fill(st->gb2.begin(), st->gb2.end(), 0.0);
-                std::fill(st->gW3.begin(), st->gW3.end(), 0.0);
-                std::fill(st->gb3.begin(), st->gb3.end(), 0.0);
-                st->shared_loss  = 0.0;
-                st->batch_start += BATCH;
-            }
-
-            // Step 5: weights written; safe to proceed
-            pthread_barrier_wait(&st->barrier_upd);
-        }
-
-        if (a->tid == 0) {
-            std::cout << "epoch " << epoch << "  lr=" << lr_t << "  loss="
-                      << (st->epoch_loss / static_cast<double>(n_batches * BATCH))
-                      << "\n";
-        }
-    }
-
-    return nullptr;
-}
-
 static MLPModel train_parallel_pthreads(const std::vector<float>& X,
                                         const Labels& y,
                                         int n_rows,
@@ -1198,52 +775,7 @@ static MLPModel train_parallel_pthreads(const std::vector<float>& X,
                                         int epochs,
                                         double lr,
                                         double lambda) {
-#if MLP_HAS_CBLAS
-    // Same reasoning as train_parallel_omp(): the BLAS backend wants the full
-    // 128-row mini-batch, not N_THREADS tiny slices plus extra barriers.
-    if (USE_BLAS_BACKEND) return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
-#endif
-    MLPModel model;
-    init_weights(model, n_features, SEED);
-    if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
-
-    MLPParState st;
-    st.X          = &X;
-    st.y          = &y;
-    st.n_rows     = n_rows;
-    st.n_features = n_features;
-    st.model      = &model;
-    st.idx.resize(n_rows);
-    std::iota(st.idx.begin(), st.idx.end(), 0);
-    st.batch_start = 0;
-    st.epoch_loss  = 0.0;
-    st.gW1.assign(H1  * n_features, 0.0); st.gb1.assign(H1,  0.0);
-    st.gW2.assign(H2  * H1,         0.0); st.gb2.assign(H2,  0.0);
-    st.gW3.assign(OUT * H2,         0.0); st.gb3.assign(OUT, 0.0);
-    st.shared_loss = 0.0;
-    st.lr          = lr;
-    st.lambda      = lambda;
-    st.seed        = SEED;
-    st.epochs      = epochs;
-
-    pthread_mutex_init(&st.mutex, nullptr);
-    pthread_barrier_init(&st.barrier_acc, nullptr, static_cast<unsigned>(N_THREADS));
-    pthread_barrier_init(&st.barrier_upd, nullptr, static_cast<unsigned>(N_THREADS));
-
-    std::vector<MLPTArg>   args(N_THREADS);
-    std::vector<pthread_t> threads(N_THREADS);
-    for (int t = 0; t < N_THREADS; ++t) {
-        args[t].st  = &st;
-        args[t].tid = t;
-        pthread_create(&threads[t], nullptr, mlp_pthread_worker, &args[t]);
-    }
-    for (int t = 0; t < N_THREADS; ++t) pthread_join(threads[t], nullptr);
-
-    pthread_mutex_destroy(&st.mutex);
-    pthread_barrier_destroy(&st.barrier_acc);
-    pthread_barrier_destroy(&st.barrier_upd);
-
-    return model;
+    return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
 }
 
 // -----------------------------------------------------------------------------
@@ -1289,25 +821,6 @@ int main(int argc, char* argv[]) {
         int n = std::atoi(env);
         if (n >= 1) BLAS_PRED_BLOCK = n;
     }
-    if (const char* env = std::getenv("MLP_BACKEND")) {
-        const std::string backend(env);
-        if (backend == "loop" || backend == "cpp" || backend == "pure") {
-            USE_BLAS_BACKEND = false;
-        } else if (backend == "blas" || backend == "blas-batch" || backend == "gemm") {
-#if MLP_HAS_CBLAS
-            USE_BLAS_BACKEND = true;
-#else
-            USE_BLAS_BACKEND = false;
-            std::cerr << "Warning: MLP_BACKEND=blas requested, but this binary "
-                      << "was not compiled with MLP_USE_BLAS; using sample-loop.\n";
-#endif
-        }
-    }
-    if (!USE_BLAS_BACKEND && BATCH % N_THREADS != 0) {
-        std::cerr << "Error: BATCH (" << BATCH << ") must be divisible by N_THREADS ("
-                  << N_THREADS << "). The pthreads trainer slices BATCH evenly.\n";
-        return 1;
-    }
 
     std::cout << "MLP - CS:GO Round Winner Classification\n";
     std::cout << "Topology: n_features -> " << H1 << " -> " << H2
@@ -1319,10 +832,8 @@ int main(int argc, char* argv[]) {
               << "  momentum=" << MOMENTUM
               << "  threads=" << N_THREADS
               << "  backend=" << active_backend_name();
-#if MLP_HAS_CBLAS
     std::cout << "  blas_provider=" << blas_provider_name()
               << "  blas_block=" << BLAS_PRED_BLOCK;
-#endif
     std::cout << "\n\n";
 
     const double t0 = now_ms();
@@ -1345,7 +856,7 @@ int main(int argc, char* argv[]) {
     Metrics sm = evaluate(ds.y_test, serial_pred);
     print_results("Serial MLP", ts1 - ts0, ts2 - ts1, sm);
 
-    // Parallel MLP (OpenMP, per-thread buffer + serial reduction)
+    // Parallel MLP (OpenMP wrapper around the BLAS batch backend)
     const double to0 = now_ms();
     MLPModel omp_model = train_parallel_omp(ds.X_train, ds.y_train,
                                             n_train, ds.n_features,
@@ -1357,7 +868,7 @@ int main(int argc, char* argv[]) {
     print_results("Parallel MLP (OpenMP, " + std::to_string(N_THREADS) + " threads)",
                   to1 - to0, to2 - to1, om);
 
-    // Parallel MLP (pthreads, mutex + barriers)
+    // Parallel MLP (pthreads wrapper around the BLAS batch backend)
     const double tp0 = now_ms();
     MLPModel pth_model = train_parallel_pthreads(ds.X_train, ds.y_train,
                                                  n_train, ds.n_features,

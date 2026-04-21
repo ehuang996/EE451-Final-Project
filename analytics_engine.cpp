@@ -23,6 +23,7 @@
 
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
@@ -75,6 +76,50 @@ static std::string trim(const std::string& s) {
 
 static bool starts_with(const std::string& s, const std::string& prefix) {
     return s.size() >= prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+static std::string shell_quote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\"'\"'";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+static std::string env_or_default(const char* name, const char* fallback) {
+    const char* value = std::getenv(name);
+    return (value && *value) ? std::string(value) : std::string(fallback);
+}
+
+static std::string build_algo_command(const std::string& binary,
+                                      const std::string& train_csv,
+                                      const std::string& test_csv,
+                                      const std::string& algorithm) {
+    const std::string threads = env_or_default("N_THREADS", "8");
+    std::ostringstream cmd;
+    cmd << "env N_THREADS=" << threads << ' ';
+
+    if (algorithm == "KNN") {
+        cmd << "OMP_NUM_THREADS=1 "
+            << "OPENBLAS_NUM_THREADS=1 "
+            << "MKL_NUM_THREADS=1 "
+            << "BLIS_NUM_THREADS=1 "
+            << "VECLIB_MAXIMUM_THREADS=1 ";
+    } else if (algorithm == "MLP") {
+        cmd << "OMP_NUM_THREADS=" << threads << ' '
+            << "OPENBLAS_NUM_THREADS=" << threads << ' '
+            << "MKL_NUM_THREADS=" << threads << ' '
+            << "BLIS_NUM_THREADS=" << threads << ' '
+            << "VECLIB_MAXIMUM_THREADS=" << threads << ' ';
+    }
+
+    cmd << shell_quote(binary) << ' '
+        << shell_quote(train_csv) << ' '
+        << shell_quote(test_csv)
+        << " 2>&1";
+    return cmd.str();
 }
 
 // Return the numeric value after the first ':' in `line`, or fallback.
@@ -342,8 +387,7 @@ int main(int argc, char* argv[]) {
     for (const auto& algo : algos) {
         // Redirect stderr to stdout so any warnings get captured too; this
         // doesn't affect the parser since [tag] blocks are unambiguous.
-        const std::string cmd = std::string(algo.binary) + " "
-                              + train_csv + " " + test_csv + " 2>&1";
+        const std::string cmd = build_algo_command(algo.binary, train_csv, test_csv, algo.name);
         std::cout << "[run] " << algo.name << " — " << cmd << "\n";
 
         int status = 0;
@@ -364,8 +408,9 @@ int main(int argc, char* argv[]) {
         std::cerr << "\nNo results parsed. Were the binaries compiled?\n";
         std::cerr << "From repo root, try:\n";
         std::cerr << "  g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/svm/svm.cpp -o svm -lpthread\n";
-        std::cerr << "  g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread\n";
-        std::cerr << "  g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread\n";
+        std::cerr << "  module load openblas\n";
+        std::cerr << "  g++ -std=c++17 -O3 -march=native -fopenmp -DKNN_USE_BLAS src/cpp/knn/knn.cpp -o knn -lpthread -lopenblas\n";
+        std::cerr << "  g++ -std=c++17 -O3 -march=native -fopenmp -DMLP_USE_BLAS src/cpp/mlp/mlp.cpp -o mlp -lpthread -lopenblas\n";
         std::cerr << "  g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/dt/dt.cpp   -o dt  -lpthread\n";
         std::cerr << "  g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/nb/nb.cpp   -o nb  -lpthread\n";
         return 1;

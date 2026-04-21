@@ -4,10 +4,8 @@
 // Label   : round_winner in {+1, -1}
 // Parallel: predict_parallel_omp (OpenMP) + predict_parallel_pthreads (pool)
 //          (training stores data + row norms; parallelism is in inference.)
-// Kernel  : cache-blocked exact brute force, optionally backed by vendor CBLAS SGEMM.
+// Kernel  : exact brute force backed by vendor CBLAS SGEMM.
 // =============================================================================
-// Pure C++:
-//   g++ -std=c++17 -O3 -march=native -fopenmp knn.cpp -o knn -lpthread
 // OpenBLAS:
 //   g++ -std=c++17 -O3 -march=native -fopenmp -DKNN_USE_BLAS knn.cpp -o knn -lpthread -lopenblas
 // MKL:
@@ -47,14 +45,13 @@
 #define KNN_HAS_CBLAS 0
 #endif
 
+#if !KNN_HAS_CBLAS
+#error "KNN now requires a BLAS backend. Compile with -DKNN_USE_BLAS, -DKNN_USE_MKL, or the platform equivalent."
+#endif
+
 static constexpr int K_NEIGHBORS = 11;
 static int N_THREADS = 8;  // overridable via N_THREADS env var (read in main)
 static int BLAS_QUERY_BLOCK = 256;  // overridable via KNN_BLAS_BLOCK env var
-#if KNN_HAS_CBLAS
-static bool USE_BLAS_BACKEND = true;  // overridable via KNN_BACKEND=blocked
-#else
-static bool USE_BLAS_BACKEND = false;
-#endif
 
 using Labels = std::vector<int>;
 
@@ -83,8 +80,6 @@ struct KNNModel {
     int k = K_NEIGHBORS;
 };
 
-static constexpr int QUERY_BLOCK = 16;
-
 static const char* blas_provider_name() {
 #if defined(KNN_USE_MKL)
     return "mkl";
@@ -100,11 +95,7 @@ static const char* blas_provider_name() {
 }
 
 static const char* active_backend_name() {
-#if KNN_HAS_CBLAS
-    return USE_BLAS_BACKEND ? "blas-sgemm" : "blocked-dot";
-#else
-    return "blocked-dot";
-#endif
+    return "blas-sgemm";
 }
 
 static double now_ms() {
@@ -394,104 +385,6 @@ static void finalize_block_predictions(const int q_count,
     }
 }
 
-static void predict_query_block(const KNNModel& model,
-                                const std::vector<float>& X_test,
-                                const std::vector<float>& test_norm2,
-                                Labels& pred,
-                                int q_begin,
-                                int q_end,
-                                std::vector<float>& qbuf,
-                                std::vector<float>& best_dist,
-                                std::vector<int>& best_label,
-                                std::vector<int>& max_idx,
-                                std::vector<float>& max_dist,
-                                std::vector<float>& dist) {
-    const int q_count = q_end - q_begin;
-    const int n_features = model.n_features;
-    const int k = model.k;
-
-    for (int j = 0; j < n_features; ++j) {
-        float* qcol = &qbuf[static_cast<size_t>(j) * QUERY_BLOCK];
-        for (int q = 0; q < q_count; ++q) {
-            qcol[q] = X_test[static_cast<size_t>(q_begin + q) * n_features + j];
-        }
-    }
-
-    const int slots = q_count * k;
-    std::fill(best_dist.begin(), best_dist.begin() + slots,
-              std::numeric_limits<float>::infinity());
-    std::fill(best_label.begin(), best_label.begin() + slots, 0);
-    std::fill(max_idx.begin(), max_idx.begin() + q_count, 0);
-    std::fill(max_dist.begin(), max_dist.begin() + q_count,
-              std::numeric_limits<float>::infinity());
-
-    for (int i = 0; i < model.n_rows; ++i) {
-        const float train_norm = model.norm2[i];
-        for (int q = 0; q < q_count; ++q) {
-            dist[q] = train_norm + test_norm2[q_begin + q];
-        }
-
-        const float* xi = &model.X[static_cast<size_t>(i) * n_features];
-        for (int j = 0; j < n_features; ++j) {
-            const float scale = -2.0f * xi[j];
-            const float* qcol = &qbuf[static_cast<size_t>(j) * QUERY_BLOCK];
-#ifdef _OPENMP
-#pragma omp simd
-#endif
-            for (int q = 0; q < q_count; ++q) {
-                dist[q] += scale * qcol[q];
-            }
-        }
-
-        const int label = model.y[i];
-        for (int q = 0; q < q_count; ++q) {
-            const float d = dist[q];
-            if (d < max_dist[q]) {
-                const int off = q * k;
-                const int replace = max_idx[q];
-                best_dist[off + replace] = d;
-                best_label[off + replace] = label;
-
-                int next_idx = 0;
-                float next_dist = best_dist[off];
-                for (int t = 1; t < k; ++t) {
-                    const float candidate = best_dist[off + t];
-                    if (candidate > next_dist) {
-                        next_dist = candidate;
-                        next_idx = t;
-                    }
-                }
-                max_idx[q] = next_idx;
-                max_dist[q] = next_dist;
-            }
-        }
-    }
-
-    finalize_block_predictions(q_count, k, best_dist, best_label, pred, q_begin);
-}
-
-static void predict_blocked_range(const KNNModel& model,
-                                  const std::vector<float>& X_test,
-                                  const std::vector<float>& test_norm2,
-                                  Labels& pred,
-                                  int q_begin,
-                                  int q_end) {
-    const int k = model.k;
-    std::vector<float> qbuf(static_cast<size_t>(model.n_features) * QUERY_BLOCK);
-    std::vector<float> best_dist(static_cast<size_t>(QUERY_BLOCK) * k);
-    std::vector<int> best_label(static_cast<size_t>(QUERY_BLOCK) * k);
-    std::vector<int> max_idx(QUERY_BLOCK);
-    std::vector<float> max_dist(QUERY_BLOCK);
-    std::vector<float> dist(QUERY_BLOCK);
-
-    for (int q0 = q_begin; q0 < q_end; q0 += QUERY_BLOCK) {
-        const int q1 = std::min(q0 + QUERY_BLOCK, q_end);
-        predict_query_block(model, X_test, test_norm2, pred, q0, q1,
-                            qbuf, best_dist, best_label, max_idx, max_dist, dist);
-    }
-}
-
-#if KNN_HAS_CBLAS
 static void predict_blas_block(const KNNModel& model,
                                const std::vector<float>& X_test,
                                const std::vector<float>& test_norm2,
@@ -654,100 +547,21 @@ static Labels predict_blas_parallel_pthreads(const KNNModel& model,
     for (int t = 0; t < N_THREADS; ++t) pthread_join(threads[t], nullptr);
     return pred;
 }
-#endif
 
 static Labels predict_serial(const KNNModel& model, const std::vector<float>& X_test, int n_test) {
-#if KNN_HAS_CBLAS
-    if (USE_BLAS_BACKEND) return predict_blas_serial(model, X_test, n_test);
-#endif
-    Labels pred(n_test);
-    const std::vector<float> test_norm2 = row_norms(X_test, n_test, model.n_features);
-    predict_blocked_range(model, X_test, test_norm2, pred, 0, n_test);
-    return pred;
+    return predict_blas_serial(model, X_test, n_test);
 }
 
 static Labels predict_parallel_omp(const KNNModel& model,
                                    const std::vector<float>& X_test,
                                    int n_test) {
-#if KNN_HAS_CBLAS
-    if (USE_BLAS_BACKEND) return predict_blas_parallel_omp(model, X_test, n_test);
-#endif
-    Labels pred(n_test);
-    const std::vector<float> test_norm2 = row_norms(X_test, n_test, model.n_features);
-#ifdef _OPENMP
-    const int n_blocks = (n_test + QUERY_BLOCK - 1) / QUERY_BLOCK;
-#pragma omp parallel num_threads(N_THREADS)
-    {
-        const int k = model.k;
-        std::vector<float> qbuf(static_cast<size_t>(model.n_features) * QUERY_BLOCK);
-        std::vector<float> best_dist(static_cast<size_t>(QUERY_BLOCK) * k);
-        std::vector<int> best_label(static_cast<size_t>(QUERY_BLOCK) * k);
-        std::vector<int> max_idx(QUERY_BLOCK);
-        std::vector<float> max_dist(QUERY_BLOCK);
-        std::vector<float> dist(QUERY_BLOCK);
-
-#pragma omp for schedule(static)
-        for (int b = 0; b < n_blocks; ++b) {
-            const int q0 = b * QUERY_BLOCK;
-            const int q1 = std::min(q0 + QUERY_BLOCK, n_test);
-            predict_query_block(model, X_test, test_norm2, pred, q0, q1,
-                                qbuf, best_dist, best_label, max_idx, max_dist, dist);
-        }
-    }
-#else
-    predict_blocked_range(model, X_test, test_norm2, pred, 0, n_test);
-#endif
-    return pred;
-}
-
-// -----------------------------------------------------------------------------
-// predict_parallel_pthreads — same algorithm as predict_parallel_omp, but
-// dispatched via a fixed pool of N_THREADS pthreads with a static slice of
-// the test set per worker. Each sample's k-NN search is independent — no
-// shared mutable state, so there's no mutex and no barrier needed; the only
-// synchronization is pthread_join at the end.
-// -----------------------------------------------------------------------------
-
-struct KNNPredArg {
-    const KNNModel*           model;
-    const std::vector<float>* X_test;
-    const std::vector<float>* test_norm2;
-    Labels*                   pred;
-    int                       s_off;  // inclusive start of this worker's slice
-    int                       e_off;  // exclusive end
-};
-
-static void* knn_pthread_worker(void* raw) {
-    auto* a = static_cast<KNNPredArg*>(raw);
-    predict_blocked_range(*a->model, *a->X_test, *a->test_norm2, *a->pred,
-                          a->s_off, a->e_off);
-    return nullptr;
+    return predict_blas_parallel_omp(model, X_test, n_test);
 }
 
 static Labels predict_parallel_pthreads(const KNNModel& model,
                                         const std::vector<float>& X_test,
                                         int n_test) {
-#if KNN_HAS_CBLAS
-    if (USE_BLAS_BACKEND) return predict_blas_parallel_pthreads(model, X_test, n_test);
-#endif
-    Labels pred(n_test);
-    if (n_test == 0) return pred;
-
-    const int slice = n_test / N_THREADS;
-    const std::vector<float> test_norm2 = row_norms(X_test, n_test, model.n_features);
-    std::vector<KNNPredArg>  args(N_THREADS);
-    std::vector<pthread_t>   threads(N_THREADS);
-    for (int t = 0; t < N_THREADS; ++t) {
-        args[t].model      = &model;
-        args[t].X_test     = &X_test;
-        args[t].test_norm2 = &test_norm2;
-        args[t].pred       = &pred;
-        args[t].s_off      = t * slice;
-        args[t].e_off      = (t == N_THREADS - 1) ? n_test : (t + 1) * slice;
-        pthread_create(&threads[t], nullptr, knn_pthread_worker, &args[t]);
-    }
-    for (int t = 0; t < N_THREADS; ++t) pthread_join(threads[t], nullptr);
-    return pred;
+    return predict_blas_parallel_pthreads(model, X_test, n_test);
 }
 
 static Metrics evaluate(const Labels& truth, const Labels& pred) {
@@ -804,20 +618,6 @@ int main(int argc, char* argv[]) {
         int n = std::atoi(env);
         if (n >= 1) BLAS_QUERY_BLOCK = n;
     }
-    if (const char* env = std::getenv("KNN_BACKEND")) {
-        const std::string backend(env);
-        if (backend == "blocked" || backend == "cpp" || backend == "pure") {
-            USE_BLAS_BACKEND = false;
-        } else if (backend == "blas" || backend == "blas-sgemm" || backend == "sgemm") {
-#if KNN_HAS_CBLAS
-            USE_BLAS_BACKEND = true;
-#else
-            USE_BLAS_BACKEND = false;
-            std::cerr << "Warning: KNN_BACKEND=blas requested, but this binary "
-                      << "was not compiled with KNN_USE_BLAS; using blocked-dot.\n";
-#endif
-        }
-    }
 
     std::cout << "KNN - CS:GO Round Winner Classification\n";
     std::cout << "Config: k=" << k
@@ -825,10 +625,8 @@ int main(int argc, char* argv[]) {
               << "  epochs=N/A (lazy learner)"
               << "  threads=" << N_THREADS
               << "  backend=" << active_backend_name();
-#if KNN_HAS_CBLAS
     std::cout << "  blas_provider=" << blas_provider_name()
               << "  blas_block=" << BLAS_QUERY_BLOCK;
-#endif
     std::cout << "\n\n";
 
     const double t0 = now_ms();

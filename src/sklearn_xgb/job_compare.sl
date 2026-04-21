@@ -12,17 +12,29 @@ set -e
 # binary's stdout into src/sklearn_xgb/logs/<algo>.out for the parser.
 # Run from the repo root: `sbatch src/sklearn_xgb/job_compare.sl`.
 # ----------------------------------------------------------------------------
+module load gcc/13.3.0 2>/dev/null || true
+module load openblas 2>/dev/null || true
 mkdir -p src/sklearn_xgb/logs
 
+: "${KNN_BLAS_CFLAGS:=-DKNN_USE_BLAS}"
+: "${KNN_BLAS_LIBS:=-lopenblas}"
+: "${MLP_BLAS_CFLAGS:=-DMLP_USE_BLAS}"
+: "${MLP_BLAS_LIBS:=-lopenblas}"
+: "${THREADS:=${N_THREADS:-${SLURM_CPUS_PER_TASK:-8}}}"
+
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/svm/svm.cpp -o svm -lpthread
-g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
-g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp $KNN_BLAS_CFLAGS src/cpp/knn/knn.cpp -o knn -lpthread $KNN_BLAS_LIBS
+g++ -std=c++17 -O3 -march=native -fopenmp $MLP_BLAS_CFLAGS src/cpp/mlp/mlp.cpp -o mlp -lpthread $MLP_BLAS_LIBS
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/dt/dt.cpp   -o dt  -lpthread
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/nb/nb.cpp   -o nb  -lpthread
 
 ./svm data/train_cleaned.csv data/test_cleaned.csv > src/sklearn_xgb/logs/svm.out
-./knn data/train_cleaned.csv data/test_cleaned.csv > src/sklearn_xgb/logs/knn.out
-./mlp data/train_cleaned.csv data/test_cleaned.csv > src/sklearn_xgb/logs/mlp.out
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 N_THREADS=$THREADS \
+    ./knn data/train_cleaned.csv data/test_cleaned.csv > src/sklearn_xgb/logs/knn.out
+OMP_NUM_THREADS=$THREADS OPENBLAS_NUM_THREADS=$THREADS MKL_NUM_THREADS=$THREADS \
+BLIS_NUM_THREADS=$THREADS VECLIB_MAXIMUM_THREADS=$THREADS N_THREADS=$THREADS \
+    ./mlp data/train_cleaned.csv data/test_cleaned.csv > src/sklearn_xgb/logs/mlp.out
 ./dt  data/train_cleaned.csv data/test_cleaned.csv > src/sklearn_xgb/logs/dt.out
 ./nb  data/train_cleaned.csv data/test_cleaned.csv > src/sklearn_xgb/logs/nb.out
 

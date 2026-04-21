@@ -10,6 +10,7 @@ set -e
 # Compute nodes don't inherit the login-node default toolchain; without this
 # `g++` resolves to system GCC 8 with missing headers on some partitions.
 module load gcc/13.3.0
+module load openblas 2>/dev/null || true
 
 # ----------------------------------------------------------------------------
 # Thread-scaling sweep: runs every algorithm + framework at
@@ -26,23 +27,13 @@ THREAD_COUNTS=(1 2 4 8)
 mkdir -p src/sklearn_xgb/logs
 
 # Compile all five C++ binaries + analytics_engine once (same flags everywhere).
+: "${KNN_BLAS_CFLAGS:=-DKNN_USE_BLAS}"
+: "${KNN_BLAS_LIBS:=-lopenblas}"
+: "${MLP_BLAS_CFLAGS:=-DMLP_USE_BLAS}"
+: "${MLP_BLAS_LIBS:=-lopenblas}"
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/svm/svm.cpp -o svm -lpthread
-if [[ "${USE_KNN_BLAS:-0}" == "1" ]]; then
-    module load openblas 2>/dev/null || true
-    : "${KNN_BLAS_CFLAGS:=-DKNN_USE_BLAS}"
-    : "${KNN_BLAS_LIBS:=-lopenblas}"
-    g++ -std=c++17 -O3 -march=native -fopenmp $KNN_BLAS_CFLAGS src/cpp/knn/knn.cpp -o knn -lpthread $KNN_BLAS_LIBS
-else
-    g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
-fi
-if [[ "${USE_MLP_BLAS:-0}" == "1" ]]; then
-    module load openblas 2>/dev/null || true
-    : "${MLP_BLAS_CFLAGS:=-DMLP_USE_BLAS}"
-    : "${MLP_BLAS_LIBS:=-lopenblas}"
-    g++ -std=c++17 -O3 -march=native -fopenmp $MLP_BLAS_CFLAGS src/cpp/mlp/mlp.cpp -o mlp -lpthread $MLP_BLAS_LIBS
-else
-    g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
-fi
+g++ -std=c++17 -O3 -march=native -fopenmp $KNN_BLAS_CFLAGS src/cpp/knn/knn.cpp -o knn -lpthread $KNN_BLAS_LIBS
+g++ -std=c++17 -O3 -march=native -fopenmp $MLP_BLAS_CFLAGS src/cpp/mlp/mlp.cpp -o mlp -lpthread $MLP_BLAS_LIBS
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/dt/dt.cpp   -o dt  -lpthread
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/nb/nb.cpp   -o nb  -lpthread
 g++ -std=c++17 -O3 -march=native analytics_engine.cpp -o analytics_engine
@@ -57,29 +48,10 @@ rm -f src/sklearn_xgb/results.csv src/sklearn_xgb/results.json
 # ----------------------------------------------------------------------------
 for T in "${THREAD_COUNTS[@]}"; do
     echo "=== C++ sweep: N_THREADS=$T ==="
-    # KNN's BLAS backend wants outer query parallelism with BLAS pinned to 1.
-    # MLP's BLAS backend wants the opposite: give the full thread budget to
-    # the vendor library. If both are enabled together, prioritize KNN's
-    # setting here and rerun an MLP-only sweep when you want best MLP timing.
-    if [[ "${USE_KNN_BLAS:-0}" == "1" ]]; then
-        OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
-            N_THREADS=$T ./analytics_engine \
-            data/train_cleaned.csv \
-            data/test_cleaned.csv \
-            "analytics_results_t${T}.csv"
-    elif [[ "${USE_MLP_BLAS:-0}" == "1" ]]; then
-        OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T \
-        BLIS_NUM_THREADS=$T VECLIB_MAXIMUM_THREADS=$T \
-            N_THREADS=$T ./analytics_engine \
-            data/train_cleaned.csv \
-            data/test_cleaned.csv \
-            "analytics_results_t${T}.csv"
-    else
-        N_THREADS=$T ./analytics_engine \
-            data/train_cleaned.csv \
-            data/test_cleaned.csv \
-            "analytics_results_t${T}.csv"
-    fi
+    N_THREADS=$T ./analytics_engine \
+        data/train_cleaned.csv \
+        data/test_cleaned.csv \
+        "analytics_results_t${T}.csv"
 done
 
 # Merge: keep header from the first file, skip headers from the rest.

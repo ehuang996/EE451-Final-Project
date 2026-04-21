@@ -19,10 +19,11 @@ of memory traffic), so the parallel work isn't memory-bandwidth-starved.
 The MLP's 8-core speedup number is therefore the **headline empirical claim**
 of the paper.
 
-That statement still describes the original pure C++ sample-loop backend. The
-current implementation also has an optional vendor-BLAS backend that rewrites
-each minibatch as dense matrix multiplies. That BLAS path is now the
-performance-oriented design and the right counterfactual against sklearn's own
+That statement originally described the sample-loop backend. The current source
+tree no longer ships that path: MLP is now BLAS-only, with each minibatch
+rewritten as dense matrix multiplies. Historical sample-loop benchmark rows
+remain below for comparison, but the supported implementation on CARC is the
+vendor-BLAS backend and the right counterfactual against sklearn's own
 BLAS-backed `MLPClassifier`.
 
 ---
@@ -104,24 +105,16 @@ N_THREADS  = 8     (matched to SLURM --cpus-per-task=8)
 SEED       = 42
 ```
 
-`main()` enforces the even-slicing invariant for the sample-loop pthreads
-trainer. `N_THREADS` and the algorithm-internal
-hyperparameters (`H1`, `H2`, `BATCH`, `MOMENTUM`, `SEED`) stay `constexpr`;
-`epochs`, `lr`, and `lambda` are runtime parameters so the CLI signature
+`N_THREADS` and the algorithm-internal hyperparameters (`H1`, `H2`, `BATCH`,
+`MOMENTUM`, `SEED`) stay `constexpr`; `epochs`, `lr`, and `lambda` are runtime
+parameters so the CLI signature
 (`./mlp train test [epochs] [lr] [lambda]`) matches SVM.
 
 Runtime backend controls:
 
-- `N_THREADS=<n>`: thread budget for the sample-loop OpenMP / pthread paths.
-- `MLP_BACKEND=loop|cpp|pure`: force the original per-sample C++ backend.
-- `MLP_BACKEND=blas|blas-batch|gemm`: force the vendor-BLAS backend (only when
-  compiled with `MLP_USE_BLAS` or `MLP_USE_MKL`).
+- `N_THREADS=<n>`: thread budget used by the BLAS-backed execution path.
 - `MLP_BLAS_BLOCK=<rows>`: prediction block size for the BLAS inference path
   (`512` by default).
-
-The `BATCH % N_THREADS == 0` restriction now applies only to the sample-loop
-pthreads trainer. The BLAS backend trains on the full 128-row minibatch and
-does not require even slicing.
 
 ---
 
@@ -204,16 +197,18 @@ features on the current cleaned CSVs, expect `72 z-scored, 31 passthrough`.
 
 The file now exposes the same public entry points (`train_serial`,
 `train_parallel_omp`, `train_parallel_pthreads`, `predict_serial`,
-`predict_parallel`) over two different inner kernels:
+`predict_parallel`) over two inner-kernel eras:
 
-1. **Sample-loop backend**: the original pure C++ implementation.
-2. **BLAS batch backend**: optional, compiled with `MLP_USE_BLAS` /
-   `MLP_USE_MKL`, and enabled by default when CBLAS is present.
+1. **Sample-loop backend**: the original pure C++ implementation, now removed
+   from the current tree but kept here as historical context for earlier
+   benchmark rows.
+2. **BLAS batch backend**: the current implementation, compiled with
+   `MLP_USE_BLAS` / `MLP_USE_MKL`.
 
 The model, loss, optimizer, normalization, and metrics are unchanged across
 the two backends. Only the dense linear algebra implementation changes.
 
-### 5a. Sample-loop backend (`MLP_BACKEND=loop`)
+### 5a. Historical sample-loop backend (removed)
 
 This is the original design:
 
@@ -225,11 +220,10 @@ This is the original design:
   reduction over `N_THREADS`.
 - `train_parallel_pthreads(...)` uses mutex + two barriers per minibatch.
 
-This path is still the portable no-dependency baseline and still matters for
-the writeup because it isolates what plain C++ + OpenMP/pthreads can do
-without any vendor math library.
+This path remains relevant only as historical baseline context for the writeup.
+It is no longer present in the current source tree.
 
-### 5b. BLAS batch backend (`MLP_BACKEND=blas`)
+### 5b. BLAS batch backend
 
 The BLAS path stops thinking in terms of one sample at a time and instead
 treats each minibatch as dense row-major matrices:
@@ -375,10 +369,9 @@ hands the CPU budget to BLAS instead of forcing single-threaded BLAS.
    path was removed for exactly this reason. Do not reintroduce per-thread
    minibatch slices on top of threaded BLAS unless layer sizes change enough
    to justify it.
-4. **Backend mismatch**: `MLP_BACKEND=blas` on a pure build prints a warning
-   and falls back to `sample-loop`.
-5. **Parity expectations**: sample-loop and BLAS backends should stay within
-   the same accuracy band. The exact per-epoch loss text can still differ
+4. **Historical parity expectations**: the removed sample-loop backend and the
+   current BLAS backend should stay within the same accuracy band. The exact
+   per-epoch loss text can still differ
    slightly because the reduction order changes.
 
 ---
@@ -389,7 +382,6 @@ On USC CARC (from `src/cpp/mlp/`):
 
 ```bash
 cd src/cpp/mlp && sbatch job_mlp.sl
-USE_MLP_BLAS=1 sbatch job_mlp.sl
 ```
 
 The BLAS job path accepts:
@@ -401,7 +393,7 @@ The BLAS job path accepts:
 The consolidated sweep script also supports:
 
 ```bash
-USE_MLP_BLAS=1 sbatch slurm/job_sweep.sl
+sbatch slurm/job_sweep.sl
 ```
 
 CLI:
@@ -414,9 +406,6 @@ CLI:
 Local build examples from the repo root:
 
 ```bash
-# Pure C++
-g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
-
 # Linux / OpenBLAS
 g++ -std=c++17 -O3 -march=native -fopenmp -DMLP_USE_BLAS \
   src/cpp/mlp/mlp.cpp -o mlp -lpthread -lopenblas
@@ -435,9 +424,6 @@ Runtime examples:
 # Recommended BLAS-backed run on macOS
 VECLIB_MAXIMUM_THREADS=8 N_THREADS=8 ./mlp data/train_cleaned.csv data/test_cleaned.csv
 
-# Force the original pure backend from a BLAS-compiled binary
-MLP_BACKEND=loop N_THREADS=8 ./mlp data/train_cleaned.csv data/test_cleaned.csv
-
 # Tune BLAS prediction blocking
 MLP_BLAS_BLOCK=1024 ./mlp data/train_cleaned.csv data/test_cleaned.csv
 ```
@@ -447,8 +433,8 @@ Verification targets:
 - **Accuracy**: `acc` stays in the `0.76-0.80` band on the full test split.
 - **Parity**: `|acc_serial - acc_omp| < 0.01` and
   `|acc_serial - acc_pthreads| < 0.01`.
-- **Backend fallback**: `MLP_BACKEND=loop` on a BLAS build reproduces the old
-  sample-loop behavior.
+- **Parity**: serial / OMP / pthread wrappers should stay numerically aligned,
+  because they all call the same BLAS-backed trainer.
 
 ---
 
@@ -465,7 +451,7 @@ Latest local BLAS notes (same-machine checks after the vendor-BLAS rewrite):
 - `MLP_USE_BLAS` + Accelerate, `VECLIB_MAXIMUM_THREADS=8`, `N_THREADS=8`:
   serial `2.241 s`, OMP `2.268 s`, pthreads `2.242 s`, all at `0.7773`
   accuracy with exact parity.
-- Same source tree, pure sample-loop build from the earlier local run:
+- Historical pure sample-loop build from the earlier local run:
   serial `22.323 s`, pthreads `6.341 s` on the full dataset.
 - sklearn `MLPClassifier` with matched hyperparameters on the same machine:
   train `5.182 s`, infer `5.22 ms`, accuracy `0.7546`.
@@ -474,8 +460,8 @@ Latest local BLAS notes (same-machine checks after the vendor-BLAS rewrite):
 
 ## 11. Followups
 
-- **Rerun CARC sweep with `USE_MLP_BLAS=1`** so the paper has cluster numbers
-  for the new backend instead of only the original sample-loop row.
+- **Rerun CARC sweep** so the paper has cluster numbers for the new backend
+  instead of only the original sample-loop row.
 - **Per-algorithm BLAS env in `analytics_engine.cpp`** if we want one sweep to
   optimize KNN (`BLAS threads = 1`) and MLP (`BLAS threads = N_THREADS`)
   simultaneously.

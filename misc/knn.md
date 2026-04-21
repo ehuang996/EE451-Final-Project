@@ -30,15 +30,15 @@ distance matrix through a BLAS-style dot product
 (`‖a − b‖² = ‖a‖² + ‖b‖² − 2·a·b`) instead of a scalar `(xq[j] - xi[j])²`
 inner loop.
 
-**Implementation update (2026-04-21).** We moved our KNN kernel from a direct
-single-query squared-distance loop to a cache-blocked dot-product formulation:
-precompute `‖xi‖²`, process 16 test queries at a time, and evaluate distances as
-`‖xq‖² + ‖xi‖² − 2·xq·xi`. The default build remains pure C++17 plus
-OpenMP/pthreads for apples-to-apples project results, and now there is an
-optional `KNN_USE_BLAS` backend that calls CBLAS `sgemm` on query blocks.
-With Apple Accelerate capped to one internal BLAS thread and our pthreads
-owning the outer query parallelism, local full-split inference improved to
-0.592 s vs. 1.586 s for the matching local sklearn brute KNN run.
+**Implementation update (2026-04-21 / 2026-04-21 follow-on cleanup).** The
+current tree no longer ships the old pure C++ KNN path. KNN is now BLAS-only:
+precompute `‖xi‖²`, process query blocks, and evaluate distances as
+`‖xq‖² + ‖xi‖² − 2·xq·xi` via CBLAS `sgemm`. Historical pure-C++ benchmark rows
+remain below for comparison, but the supported implementation on CARC is the
+vendor-BLAS backend. With Apple Accelerate capped to one internal BLAS thread
+and our pthreads owning the outer query parallelism, local full-split
+inference improved to 0.592 s vs. 1.586 s for the matching local sklearn brute
+KNN run.
 
 ---
 
@@ -47,10 +47,8 @@ owning the outer query parallelism, local full-split inference improved to
 For each test sample `xq`:
 1. Compute squared-L2 distance to every training sample using the equivalent
    dot-product identity `d²(xq, xi) = ‖xq‖² + ‖xi‖² − 2·xq·xi`.
-2. Default pure C++ backend: process `QUERY_BLOCK = 16` test samples at a time,
-   so each training row is loaded once and reused across the block.
-   Optional BLAS backend: process `KNN_BLAS_BLOCK` queries at a time and use
-   CBLAS `sgemm` for `X_test_block @ X_train.T`.
+2. Process `KNN_BLAS_BLOCK` queries at a time and use CBLAS `sgemm` for
+   `X_test_block @ X_train.T`.
 3. Track the k smallest distances via an O(k) linear-scan heap kept in
    `best_dist[0..k]` / `best_label[0..k]`. On each new candidate distance less
    than the current worst, replace that slot and rescan for the new max.
@@ -112,10 +110,7 @@ label wins. Deterministic and matches sklearn's behavior.
 K_NEIGHBORS = 11     (default, overridable as argv[3])
 N_THREADS   = 8      (default; overridable via N_THREADS env var — used by the
                      thread-sweep harness to run {1,2,4,8} with the same binary)
-KNN_BACKEND = blas | blocked
-                    (only relevant for a BLAS-compiled binary; default is
-                     blas when CBLAS is available, blocked otherwise)
-KNN_BLAS_BLOCK = 256 (default BLAS query block; only used by the BLAS backend)
+KNN_BLAS_BLOCK = 256 (default BLAS query block)
 ```
 
 `K_NEIGHBORS = 11` is odd (avoids ties in the common case) and matches the
@@ -134,13 +129,11 @@ oversubscribe the node.
 
 ### Backend selection model
 
-The file now supports two exact KNN backends behind the same public predictor
-entry points:
+The current source tree supports one exact KNN backend:
 
-| Build mode | Default runtime backend | Inner kernel | Dependency | Intended use |
-|------------|-------------------------|--------------|------------|--------------|
-| no BLAS macro | `blocked-dot` | hand-written blocked dot-product loop | C++17 + pthreads/OpenMP | original project comparison / from-scratch baseline |
-| `-DKNN_USE_BLAS` | `blas-sgemm` | CBLAS `sgemm` for dot-product panels | OpenBLAS, Accelerate, or generic CBLAS | sklearn counterfactual |
+| Build mode | Runtime backend | Inner kernel | Dependency | Intended use |
+|------------|-----------------|--------------|------------|--------------|
+| `-DKNN_USE_BLAS` | `blas-sgemm` | CBLAS `sgemm` for dot-product panels | OpenBLAS, Accelerate, or generic CBLAS | default build |
 | `-DKNN_USE_MKL` | `blas-sgemm` | CBLAS `sgemm` via oneMKL | Intel oneMKL | cluster/vendor-BLAS run |
 
 Compile-time macros only decide whether the binary has access to CBLAS:
@@ -155,11 +148,9 @@ Compile-time macros only decide whether the binary has access to CBLAS:
 #endif
 ```
 
-Runtime selection is deliberately separate. A BLAS-compiled binary defaults to
-`blas-sgemm`, but `KNN_BACKEND=blocked` switches back to the pure C++ path
-without recompiling. This is useful for apples-to-apples A/B timing because the
-data loader, normalization, model setup, metrics, and command-line handling are
-identical across both runs.
+There is no runtime fallback to the removed blocked-dot path in the current
+tree. Historical notes below still reference it because the earlier benchmark
+rows were collected before this cleanup.
 
 ---
 
@@ -279,15 +270,13 @@ story is moved to inference, where it actually happens.
 
 ## 6. Inference — three variants (this is the hot loop)
 
-All three variants call the active backend: pure C++ blocked-dot by default,
-or BLAS-backed SGEMM when compiled with `KNN_USE_BLAS` and not overridden by
-`KNN_BACKEND=blocked`. They differ only in how query blocks are distributed
-across threads.
+All three variants call the same BLAS-backed SGEMM path. They differ only in
+how query blocks are distributed across threads.
 
 ### 6a. `predict_serial`
 
-Computes `‖xq‖²` for the test matrix, then runs `predict_blocked_range` over
-the full test range in one thread. This is the serial baseline.
+Computes `‖xq‖²` for the test matrix, then runs `predict_blas_range` over the
+full test range in one thread. This is the serial baseline.
 
 ### 6b. `predict_parallel_omp`
 
@@ -296,7 +285,7 @@ the full test range in one thread. This is the serial baseline.
 {
     #pragma omp for schedule(static)
     for (int b = 0; b < n_blocks; ++b)
-        predict_query_block(... block b ...);
+        predict_blas_block(... block b ...);
 }
 ```
 
@@ -611,9 +600,6 @@ On USC CARC (from src/cpp/knn/):
 cd src/cpp/knn && sbatch job_knn.sl
 # outputs to knnjob.out
 # compiles knn.cpp, runs ./knn ../../../data/train_cleaned.csv ../../../data/test_cleaned.csv
-
-# Optional OpenBLAS counterfactual:
-USE_KNN_BLAS=1 sbatch job_knn.sl
 ```
 
 CLI:
@@ -622,29 +608,23 @@ CLI:
 ./knn [train_csv] [test_csv] [k]
 # defaults: data/train_cleaned.csv  data/test_cleaned.csv  11
 # env var N_THREADS overrides the default 8 (used by the sweep harness)
-# env var KNN_BACKEND=blocked forces pure C++ when the binary was built with BLAS
 # env var KNN_BLAS_BLOCK overrides the default 256-query SGEMM panel
 ```
 
 Locally (macOS), from the repo root:
 
 ```bash
-# Option A: Homebrew libomp with Apple Clang
-brew install libomp
-clang++ -std=c++17 -O3 -march=native \
-  -Xpreprocessor -fopenmp -lomp src/cpp/knn/knn.cpp -o knn -lpthread
-./knn data/train_cleaned.csv data/test_cleaned.csv
-
-# Option B: Homebrew GCC (matches CARC's g++ exactly)
+# Option A: Homebrew GCC (matches CARC's g++ exactly)
 brew install gcc
-g++-14 -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
+g++-14 -std=c++17 -O3 -march=native -fopenmp -DKNN_USE_BLAS \
+  src/cpp/knn/knn.cpp -o knn -lpthread -lopenblas
 
-# Option C: macOS Accelerate BLAS backend
+# Option B: macOS Accelerate BLAS backend
 clang++ -std=c++17 -O3 -DKNN_USE_BLAS \
   src/cpp/knn/knn.cpp -o knn -lpthread -framework Accelerate
 VECLIB_MAXIMUM_THREADS=1 N_THREADS=8 ./knn data/train_cleaned.csv data/test_cleaned.csv
 
-# Option D: Linux/OpenBLAS backend
+# Option C: Linux/OpenBLAS backend
 g++ -std=c++17 -O3 -march=native -fopenmp -DKNN_USE_BLAS \
   src/cpp/knn/knn.cpp -o knn -lpthread -lopenblas
 OPENBLAS_NUM_THREADS=1 N_THREADS=8 ./knn data/train_cleaned.csv data/test_cleaned.csv
@@ -654,8 +634,8 @@ For Intel oneMKL, compile with `-DKNN_USE_MKL` and the oneMKL link line for the
 active compiler/runtime. The source includes `mkl.h` under that macro and uses
 the same CBLAS `sgemm` call.
 
-Apple Clang without `libomp` still builds KNN's serial and pthread paths, but
-the OMP predictor falls back to the serial range path because `_OPENMP` is not
+Apple Clang without `libomp` still builds the serial and pthread paths, but the
+OpenMP predictor falls back to the serial range path because `_OPENMP` is not
 defined. Use Homebrew `libomp` when the OMP number matters.
 
 ### Verification expected
@@ -701,10 +681,11 @@ Append one row per CARC run.
   has 96–128. Running T ∈ {16, 32, 64} would confirm whether memory
   bandwidth bites at 16 or 32 threads (predicted: 15–25× at T=64, not
   linear 50×). Publish the full Amdahl/Gustafson curve.
-- **CARC BLAS sweep** — the portable `KNN_USE_BLAS` path is implemented, but
-  the reported paper row should only change after a CARC OpenBLAS/MKL sweep.
-  Use `USE_KNN_BLAS=1 sbatch slurm/job_sweep.sl`, with BLAS internal threads
-  pinned to 1, to measure whether the local Accelerate win holds on the cluster.
+- **CARC BLAS sweep** — the portable `KNN_USE_BLAS` path is now the supported
+  implementation, but the reported paper row should only change after a CARC
+  OpenBLAS/MKL sweep. Use `sbatch slurm/job_sweep.sl`, with BLAS internal
+  threads pinned to 1, to measure whether the local Accelerate win holds on the
+  cluster.
 - **Partial sort / approximate KNN** — for k=11 out of n_rows=98K, a
   priority-queue-based selection (Dutch-national-flag / introselect) would
   shave the per-query constant but doesn't change complexity.

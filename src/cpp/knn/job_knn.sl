@@ -8,25 +8,14 @@
 # Compute nodes don't inherit the login-node default toolchain; without this
 # `g++` resolves to system GCC 8 with missing headers on some partitions.
 module load gcc/13.3.0
+module load openblas 2>/dev/null || true
 
-# Compile. Default stays pure C++ for apples-to-apples project results.
-# For the vendor-BLAS counterfactual:
-#   USE_KNN_BLAS=1 sbatch job_knn.sl
-# Override KNN_BLAS_CFLAGS / KNN_BLAS_LIBS if the cluster uses MKL or a
-# non-default OpenBLAS install.
-if [[ "${USE_KNN_BLAS:-0}" == "1" ]]; then
-    module load openblas 2>/dev/null || true
-    : "${KNN_BLAS_CFLAGS:=-DKNN_USE_BLAS}"
-    : "${KNN_BLAS_LIBS:=-lopenblas}"
-    g++ -std=c++17 -O3 -march=native -fopenmp $KNN_BLAS_CFLAGS knn.cpp -o knn -lpthread $KNN_BLAS_LIBS
-else
-    g++ -std=c++17 -O3 -march=native -fopenmp knn.cpp -o knn -lpthread
-fi
+: "${KNN_BLAS_CFLAGS:=-DKNN_USE_BLAS}"
+: "${KNN_BLAS_LIBS:=-lopenblas}"
+g++ -std=c++17 -O3 -march=native -fopenmp $KNN_BLAS_CFLAGS knn.cpp -o knn -lpthread $KNN_BLAS_LIBS
 
-# Run
-if [[ "${USE_KNN_BLAS:-0}" == "1" ]]; then
-    OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
-        ./knn ../../../data/train_cleaned.csv ../../../data/test_cleaned.csv
-else
+# Run: keep outer query parallelism in our code and pin BLAS to one thread.
+: "${KNN_THREADS:=${N_THREADS:-${SLURM_CPUS_PER_TASK:-8}}}"
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 N_THREADS=$KNN_THREADS \
     ./knn ../../../data/train_cleaned.csv ../../../data/test_cleaned.csv
-fi
