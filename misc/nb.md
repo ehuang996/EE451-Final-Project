@@ -412,7 +412,7 @@ Append one row per CARC run.
 
 | date (UTC) | git SHA | features Gauss/Bern | machine/cores | serial (s) | omp (s) | pth (s) | acc_serial | acc_omp | acc_pth | speedup_omp | speedup_pth | notes |
 |------------|---------|:-------------------:|---------------|-----------:|--------:|--------:|:----------:|:-------:|:-------:|:-----------:|:-----------:|-------|
-| (pending first CARC run) | | 94/9 | CARC / 8 | | | | | | | | | expected 0.70–0.76 acc; 2–4× speedup |
+| 2026-04-20 | 526bb18 | 94/9 | CARC d17-03 / 8 | 0.0166 | 0.0061 | 0.0047 | 0.6946 | 0.6946 | 0.6946 | 2.72× | 3.56× | Full `{1,2,4,8}` sweep, job 3272373. Falls within the predicted 2–4× memory-bound range; pthreads edges OMP (3.56× vs 2.72×) because the one-shot mutex-per-worker merge is cheaper than OMP's team startup at 16 ms serial. Accuracy matches hybrid sklearn exactly (0.6946 in all three variants, 0.0000 parity). Below the 0.70–0.76 target — feature-independence assumption is badly violated on CS:GO (health↔money↔weapon counts correlated). A sklearn Bernoulli-only variant beats hybrid by 0.8pt; noted in [results/results.md](../results/results.md). |
 
 ---
 

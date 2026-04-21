@@ -2,8 +2,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16GB
-#SBATCH --time=1:00:00
+#SBATCH --time=36:00:00
 #SBATCH --output=analyticsjob.out
+
+# Compute nodes don't inherit the login-node default toolchain; without this
+# `g++` resolves to system GCC 8 with missing headers on some partitions.
+module load gcc/13.3.0
 
 # Compile all five algorithm binaries (analytics_engine invokes them as subprocesses).
 # Sources live at src/cpp/<algo>/<algo>.cpp; binaries land in the repo root so

@@ -396,7 +396,7 @@ Append one row per CARC run. Format:
 
 | date (UTC) | git SHA | epochs | batch | machine/cores | serial (s) | omp (s) | pth (s) | acc_serial | acc_omp | acc_pth | speedup_omp | speedup_pth | notes |
 |------------|---------|:------:|:-----:|---------------|-----------:|--------:|--------:|:----------:|:-------:|:-------:|:-----------:|:-----------:|-------|
-| (pending first CARC run) | | 30 | 128 | CARC / 8 | | | | | | | | | expected ~0.78 acc, 4–6× speedup |
+| 2026-04-20 | 526bb18 | 30 | 128 | CARC d17-03 / 8 | 42.01 | 9.24 | 9.09 | 0.7748 | 0.7748 | 0.7727 | 4.55× | 4.62× | Full `{1,2,4,8}` sweep, job 3272373. Accuracy matches proposal target; 4.6× lags the hypothesis's "highest of five." Root cause: H1=64, H2=32 is too small — inner matmuls (128×103, 128×64) leave compute intensity below the threshold where BLAS-style parallelism dominates barrier overhead. KNN outscales at 6.26×. See [results/results.md](../results/results.md). |
 
 ---
 
