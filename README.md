@@ -79,7 +79,7 @@ intensity and suitability for SIMD optimizations.
 │   │   │   ├── knn.cpp        K-Nearest Neighbors, OMP + pthreads inference
 │   │   │   └── job_knn.sl     Per-algo SLURM script (outputs knnjob.out)
 │   │   ├── mlp/
-│   │   │   ├── mlp.cpp        MLP, BCE + L2, OMP + pthreads trainers
+│   │   │   ├── mlp.cpp        MLP, BCE + L2, sample-loop + optional BLAS batch backend
 │   │   │   └── job_mlp.sl     Per-algo SLURM script (outputs mlpjob.out)
 │   │   ├── dt/
 │   │   │   ├── dt.cpp         Decision Tree, histogram CART, OMP + pthreads
@@ -142,6 +142,15 @@ sbatch src/sklearn_xgb/job_compare.sl   # outputs to src/sklearn_xgb/comparejob.
 
 All SLURM configs: 8 CPU cores, 16 GB memory, 1-hour wall time.
 
+Optional vendor-BLAS backends on CARC:
+
+```bash
+USE_KNN_BLAS=1 sbatch src/cpp/knn/job_knn.sl
+USE_MLP_BLAS=1 sbatch src/cpp/mlp/job_mlp.sl
+USE_KNN_BLAS=1 sbatch slurm/job_sweep.sl
+USE_MLP_BLAS=1 sbatch slurm/job_sweep.sl
+```
+
 ### Local compile
 
 The build command for each algorithm is intentionally the same so comparisons
@@ -181,6 +190,27 @@ Intel's MKL link advisor for your compiler/runtime.
 Use `KNN_BACKEND=blocked` with a BLAS-compiled binary to force the pure C++
 blocked-dot kernel, and `KNN_BLAS_BLOCK=<queries>` to tune SGEMM query-block
 size.
+
+MLP also has an optional vendor-BLAS backend. Unlike KNN, the BLAS path owns
+the dense minibatch kernels directly, so the recommended run mode is to hand
+the thread budget to the BLAS library rather than pinning it to 1:
+
+```bash
+# Linux/OpenBLAS
+g++ -std=c++17 -O3 -march=native -fopenmp -DMLP_USE_BLAS \
+  src/cpp/mlp/mlp.cpp -o mlp -lpthread -lopenblas
+OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 N_THREADS=8 \
+  ./mlp data/train_cleaned.csv data/test_cleaned.csv
+
+# macOS/Accelerate
+clang++ -std=c++17 -O3 -DMLP_USE_BLAS \
+  src/cpp/mlp/mlp.cpp -o mlp -lpthread -framework Accelerate
+VECLIB_MAXIMUM_THREADS=8 N_THREADS=8 ./mlp data/train_cleaned.csv data/test_cleaned.csv
+```
+
+Use `MLP_BACKEND=loop` with a BLAS-compiled binary to force the original pure
+C++ sample-loop kernel, and `MLP_BLAS_BLOCK=<rows>` to tune batched BLAS
+prediction blocking.
 
 Each binary's `resolve_path` helper searches `./`, `../`, `data/`, `../data/`,
 `../../data/`, and `../../../data/` — so you can also run them from

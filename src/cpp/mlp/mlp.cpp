@@ -4,7 +4,14 @@
 // Dataset  : train_cleaned.csv / test_cleaned.csv
 // Label    : round_winner in {+1, -1}
 // =============================================================================
-// g++ -std=c++17 -O3 -march=native -fopenmp mlp.cpp -o mlp -lpthread
+// Pure C++:
+//   g++ -std=c++17 -O3 -march=native -fopenmp mlp.cpp -o mlp -lpthread
+// OpenBLAS:
+//   g++ -std=c++17 -O3 -march=native -fopenmp -DMLP_USE_BLAS mlp.cpp -o mlp -lpthread -lopenblas
+// MKL:
+//   define MLP_USE_MKL and link with the oneMKL flags for your compiler/runtime
+// macOS Accelerate:
+//   clang++ -std=c++17 -O3 -DMLP_USE_BLAS mlp.cpp -o mlp -lpthread -framework Accelerate
 // ./mlp train_cleaned.csv test_cleaned.csv [epochs] [lr] [lambda]
 //
 // Mirrors the shared Dataset / load_dataset / Metrics / evaluate / print_results
@@ -31,6 +38,73 @@
 #include <omp.h>
 #endif
 
+#if defined(__APPLE__)
+#ifndef PTHREAD_BARRIER_SERIAL_THREAD
+#define PTHREAD_BARRIER_SERIAL_THREAD 1
+#endif
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t  cond;
+    unsigned        count;
+    unsigned        waiting;
+    unsigned        generation;
+} pthread_barrier_t;
+
+static int pthread_barrier_init(pthread_barrier_t* barrier,
+                                const void*,
+                                unsigned count) {
+    if (!barrier || count == 0) return -1;
+    if (pthread_mutex_init(&barrier->mutex, nullptr) != 0) return -1;
+    if (pthread_cond_init(&barrier->cond, nullptr) != 0) {
+        pthread_mutex_destroy(&barrier->mutex);
+        return -1;
+    }
+    barrier->count = count;
+    barrier->waiting = 0;
+    barrier->generation = 0;
+    return 0;
+}
+
+static int pthread_barrier_destroy(pthread_barrier_t* barrier) {
+    if (!barrier) return -1;
+    pthread_cond_destroy(&barrier->cond);
+    pthread_mutex_destroy(&barrier->mutex);
+    return 0;
+}
+
+static int pthread_barrier_wait(pthread_barrier_t* barrier) {
+    if (!barrier) return -1;
+    pthread_mutex_lock(&barrier->mutex);
+    const unsigned generation = barrier->generation;
+    barrier->waiting++;
+    if (barrier->waiting == barrier->count) {
+        barrier->waiting = 0;
+        barrier->generation++;
+        pthread_cond_broadcast(&barrier->cond);
+        pthread_mutex_unlock(&barrier->mutex);
+        return PTHREAD_BARRIER_SERIAL_THREAD;
+    }
+    while (generation == barrier->generation) {
+        pthread_cond_wait(&barrier->cond, &barrier->mutex);
+    }
+    pthread_mutex_unlock(&barrier->mutex);
+    return 0;
+}
+#endif
+
+#if defined(MLP_USE_MKL)
+#include <mkl.h>
+#define MLP_HAS_CBLAS 1
+#elif defined(MLP_USE_ACCELERATE) || (defined(MLP_USE_BLAS) && defined(__APPLE__))
+#include <Accelerate/Accelerate.h>
+#define MLP_HAS_CBLAS 1
+#elif defined(MLP_USE_BLAS) || defined(MLP_USE_OPENBLAS) || defined(MLP_USE_CBLAS)
+#include <cblas.h>
+#define MLP_HAS_CBLAS 1
+#else
+#define MLP_HAS_CBLAS 0
+#endif
+
 // -----------------------------------------------------------------------------
 // Hyperparameters (MLP-specific; epochs/lr/lambda also overridable via argv)
 // -----------------------------------------------------------------------------
@@ -44,9 +118,15 @@ static constexpr double LAMBDA     = 1e-4;  // L2 weight decay
 static constexpr double MOMENTUM   = 0.9;   // Polyak momentum
 static int              N_THREADS  = 8;     // overridable via N_THREADS env var (read in main)
 static constexpr int    SEED       = 42;    // RNG seed
+static int              BLAS_PRED_BLOCK = 512;  // overridable via MLP_BLAS_BLOCK env var
+#if MLP_HAS_CBLAS
+static bool             USE_BLAS_BACKEND = true;   // overridable via MLP_BACKEND=loop
+#else
+static bool             USE_BLAS_BACKEND = false;
+#endif
 
-// BATCH % N_THREADS == 0 is required by the pthreads slicing. The static_assert
-// used to guard this; now that N_THREADS is runtime, main() runs the check.
+// BATCH % N_THREADS == 0 is required only by the sample-loop pthreads trainer.
+// The BLAS backend routes training through the batch-GEMM path instead.
 
 using Labels = std::vector<int>;
 
@@ -77,6 +157,37 @@ struct MLPModel {
     std::vector<double> vW1, vb1, vW2, vb2, vW3, vb3;
     int n_features = 0;
 };
+
+struct MLPBlasWorkspace {
+    std::vector<double> A1;
+    std::vector<double> A2;
+    std::vector<double> Z3;
+    std::vector<double> DZ3;
+    std::vector<double> D2;
+    std::vector<double> D1;
+};
+
+static const char* blas_provider_name() {
+#if defined(MLP_USE_MKL)
+    return "mkl";
+#elif defined(MLP_USE_ACCELERATE) || (defined(MLP_USE_BLAS) && defined(__APPLE__))
+    return "accelerate";
+#elif defined(MLP_USE_OPENBLAS)
+    return "openblas";
+#elif defined(MLP_USE_CBLAS) || defined(MLP_USE_BLAS)
+    return "cblas";
+#else
+    return "none";
+#endif
+}
+
+static const char* active_backend_name() {
+#if MLP_HAS_CBLAS
+    return USE_BLAS_BACKEND ? "blas-batch" : "sample-loop";
+#else
+    return "sample-loop";
+#endif
+}
 
 // -----------------------------------------------------------------------------
 // Helpers (resolve_path / split_csv / is_* / parse_* match svm.cpp + knn.cpp)
@@ -438,6 +549,283 @@ static void sgd_momentum_update(MLPModel& m,
     step_w(m.W3, m.vW3, gW3);  step_b(m.b3, m.vb3, gb3);
 }
 
+#if MLP_HAS_CBLAS
+static void resize_blas_workspace(MLPBlasWorkspace& ws, int rows) {
+    ws.A1.resize(static_cast<size_t>(rows) * H1);
+    ws.A2.resize(static_cast<size_t>(rows) * H2);
+    ws.Z3.resize(rows);
+    ws.DZ3.resize(rows);
+    ws.D2.resize(static_cast<size_t>(rows) * H2);
+    ws.D1.resize(static_cast<size_t>(rows) * H1);
+}
+
+static void pack_indexed_batch_double(const std::vector<float>& X,
+                                      const Labels& y,
+                                      const std::vector<int>& idx,
+                                      int batch_start,
+                                      int rows,
+                                      int n_features,
+                                      std::vector<double>& Xb,
+                                      std::vector<double>& target) {
+    Xb.resize(static_cast<size_t>(rows) * n_features);
+    target.resize(rows);
+    for (int i = 0; i < rows; ++i) {
+        const int sample = idx[batch_start + i];
+        const float* src = &X[static_cast<size_t>(sample) * n_features];
+        double* dst = &Xb[static_cast<size_t>(i) * n_features];
+        for (int j = 0; j < n_features; ++j) dst[j] = static_cast<double>(src[j]);
+        target[i] = (y[sample] == 1) ? 1.0 : 0.0;
+    }
+}
+
+static void pack_contiguous_rows_double(const std::vector<float>& X,
+                                        int row_begin,
+                                        int row_end,
+                                        int n_features,
+                                        std::vector<double>& Xb) {
+    const int rows = row_end - row_begin;
+    Xb.resize(static_cast<size_t>(rows) * n_features);
+    for (int i = 0; i < rows; ++i) {
+        const float* src = &X[static_cast<size_t>(row_begin + i) * n_features];
+        double* dst = &Xb[static_cast<size_t>(i) * n_features];
+        for (int j = 0; j < n_features; ++j) dst[j] = static_cast<double>(src[j]);
+    }
+}
+
+static void apply_bias_relu(double* X, int rows, int cols, const std::vector<double>& bias) {
+    for (int i = 0; i < rows; ++i) {
+        double* row = X + static_cast<size_t>(i) * cols;
+        for (int j = 0; j < cols; ++j) {
+            const double v = row[j] + bias[j];
+            row[j] = (v > 0.0) ? v : 0.0;
+        }
+    }
+}
+
+static void column_sums(const std::vector<double>& X, int rows, int cols, std::vector<double>& out) {
+    std::fill(out.begin(), out.end(), 0.0);
+    for (int i = 0; i < rows; ++i) {
+        const double* row = &X[static_cast<size_t>(i) * cols];
+        for (int j = 0; j < cols; ++j) out[j] += row[j];
+    }
+}
+
+static void forward_batch_blas(const MLPModel& m,
+                               const double* Xb,
+                               int rows,
+                               int n_features,
+                               MLPBlasWorkspace& ws) {
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                rows, H1, n_features,
+                1.0,
+                Xb, n_features,
+                m.W1.data(), n_features,
+                0.0,
+                ws.A1.data(), H1);
+    apply_bias_relu(ws.A1.data(), rows, H1, m.b1);
+
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                rows, H2, H1,
+                1.0,
+                ws.A1.data(), H1,
+                m.W2.data(), H1,
+                0.0,
+                ws.A2.data(), H2);
+    apply_bias_relu(ws.A2.data(), rows, H2, m.b2);
+
+    cblas_dgemv(CblasRowMajor, CblasNoTrans,
+                rows, H2,
+                1.0,
+                ws.A2.data(), H2,
+                m.W3.data(), 1,
+                0.0,
+                ws.Z3.data(), 1);
+    for (int i = 0; i < rows; ++i) ws.Z3[i] += m.b3[0];
+}
+
+static double backward_batch_blas(const MLPModel& m,
+                                  const double* Xb,
+                                  const double* target,
+                                  int rows,
+                                  int n_features,
+                                  MLPBlasWorkspace& ws,
+                                  std::vector<double>& gW1,
+                                  std::vector<double>& gb1,
+                                  std::vector<double>& gW2,
+                                  std::vector<double>& gb2,
+                                  std::vector<double>& gW3,
+                                  std::vector<double>& gb3) {
+    if (rows <= 0) return 0.0;
+
+    forward_batch_blas(m, Xb, rows, n_features, ws);
+
+    double loss = 0.0;
+    for (int i = 0; i < rows; ++i) {
+        loss += bce_loss(ws.Z3[i], static_cast<int>(target[i]));
+        ws.DZ3[i] = sigmoid(ws.Z3[i]) - target[i];
+    }
+
+    cblas_dgemv(CblasRowMajor, CblasTrans,
+                rows, H2,
+                1.0,
+                ws.A2.data(), H2,
+                ws.DZ3.data(), 1,
+                0.0,
+                gW3.data(), 1);
+    gb3[0] = std::accumulate(ws.DZ3.begin(), ws.DZ3.begin() + rows, 0.0);
+
+    for (int i = 0; i < rows; ++i) {
+        double* d2 = &ws.D2[static_cast<size_t>(i) * H2];
+        const double* a2 = &ws.A2[static_cast<size_t>(i) * H2];
+        const double dz3 = ws.DZ3[i];
+        for (int j = 0; j < H2; ++j) {
+            const double v = dz3 * m.W3[j];
+            d2[j] = (a2[j] > 0.0) ? v : 0.0;
+        }
+    }
+
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                H2, H1, rows,
+                1.0,
+                ws.D2.data(), H2,
+                ws.A1.data(), H1,
+                0.0,
+                gW2.data(), H1);
+    column_sums(ws.D2, rows, H2, gb2);
+
+    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                rows, H1, H2,
+                1.0,
+                ws.D2.data(), H2,
+                m.W2.data(), H1,
+                0.0,
+                ws.D1.data(), H1);
+    for (int i = 0; i < rows; ++i) {
+        double* d1 = &ws.D1[static_cast<size_t>(i) * H1];
+        const double* a1 = &ws.A1[static_cast<size_t>(i) * H1];
+        for (int j = 0; j < H1; ++j) {
+            if (a1[j] <= 0.0) d1[j] = 0.0;
+        }
+    }
+
+    cblas_dgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                H1, n_features, rows,
+                1.0,
+                ws.D1.data(), H1,
+                Xb, n_features,
+                0.0,
+                gW1.data(), n_features);
+    column_sums(ws.D1, rows, H1, gb1);
+
+    return loss;
+}
+
+static void predict_blas_range(const MLPModel& m,
+                               const std::vector<float>& X,
+                               Labels& out,
+                               int row_begin,
+                               int row_end,
+                               int n_features) {
+    const int block = std::max(1, BLAS_PRED_BLOCK);
+    std::vector<double> Xb(static_cast<size_t>(block) * n_features);
+    MLPBlasWorkspace ws;
+    resize_blas_workspace(ws, block);
+
+    for (int r0 = row_begin; r0 < row_end; r0 += block) {
+        const int r1 = std::min(r0 + block, row_end);
+        const int rows = r1 - r0;
+        pack_contiguous_rows_double(X, r0, r1, n_features, Xb);
+        forward_batch_blas(m, Xb.data(), rows, n_features, ws);
+        for (int i = 0; i < rows; ++i) out[r0 + i] = (ws.Z3[i] >= 0.0) ? 1 : -1;
+    }
+}
+
+static Labels predict_serial_blas(const MLPModel& m,
+                                  const std::vector<float>& X,
+                                  int n_rows,
+                                  int n_features) {
+    Labels out(n_rows);
+    predict_blas_range(m, X, out, 0, n_rows, n_features);
+    return out;
+}
+
+static Labels predict_parallel_blas(const MLPModel& m,
+                                    const std::vector<float>& X,
+                                    int n_rows,
+                                    int n_features) {
+    Labels out(n_rows);
+#ifdef _OPENMP
+    const int block = std::max(1, BLAS_PRED_BLOCK);
+    const int n_blocks = (n_rows + block - 1) / block;
+#pragma omp parallel num_threads(N_THREADS)
+    {
+        std::vector<double> Xb(static_cast<size_t>(block) * n_features);
+        MLPBlasWorkspace ws;
+        resize_blas_workspace(ws, block);
+
+#pragma omp for schedule(static)
+        for (int b = 0; b < n_blocks; ++b) {
+            const int r0 = b * block;
+            const int r1 = std::min(r0 + block, n_rows);
+            const int rows = r1 - r0;
+            pack_contiguous_rows_double(X, r0, r1, n_features, Xb);
+            forward_batch_blas(m, Xb.data(), rows, n_features, ws);
+            for (int i = 0; i < rows; ++i) out[r0 + i] = (ws.Z3[i] >= 0.0) ? 1 : -1;
+        }
+    }
+#else
+    predict_blas_range(m, X, out, 0, n_rows, n_features);
+#endif
+    return out;
+}
+
+static MLPModel train_serial_blas(const std::vector<float>& X,
+                                  const Labels& y,
+                                  int n_rows,
+                                  int n_features,
+                                  int epochs,
+                                  double lr,
+                                  double lambda) {
+    MLPModel model;
+    init_weights(model, n_features, SEED);
+    if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
+
+    std::vector<int> idx(n_rows);
+    std::iota(idx.begin(), idx.end(), 0);
+    std::mt19937 rng(SEED);
+
+    std::vector<double> batch_X(static_cast<size_t>(BATCH) * n_features);
+    std::vector<double> batch_target(BATCH);
+    MLPBlasWorkspace ws;
+    resize_blas_workspace(ws, BATCH);
+
+    std::vector<double> gW1(H1 * n_features), gb1(H1);
+    std::vector<double> gW2(H2 * H1),         gb2(H2);
+    std::vector<double> gW3(OUT * H2),        gb3(OUT);
+
+    const int n_batches = n_rows / BATCH;
+    for (int e = 0; e < epochs; ++e) {
+        std::shuffle(idx.begin(), idx.end(), rng);
+        const double lr_t = lr / std::sqrt(static_cast<double>(e + 1));
+        double epoch_loss = 0.0;
+
+        for (int bi = 0; bi < n_batches; ++bi) {
+            const int bs = bi * BATCH;
+            pack_indexed_batch_double(X, y, idx, bs, BATCH, n_features, batch_X, batch_target);
+            epoch_loss += backward_batch_blas(model, batch_X.data(), batch_target.data(),
+                                              BATCH, n_features, ws,
+                                              gW1, gb1, gW2, gb2, gW3, gb3);
+            sgd_momentum_update(model, gW1, gb1, gW2, gb2, gW3, gb3,
+                                lambda, lr_t, BATCH);
+        }
+
+        std::cout << "epoch " << e << "  lr=" << lr_t << "  loss="
+                  << (epoch_loss / static_cast<double>(n_batches * BATCH)) << "\n";
+    }
+    return model;
+}
+#endif
+
 // -----------------------------------------------------------------------------
 // Inference
 // -----------------------------------------------------------------------------
@@ -445,6 +833,9 @@ static Labels predict_serial(const MLPModel& m,
                              const std::vector<float>& X,
                              int n_rows,
                              int n_features) {
+#if MLP_HAS_CBLAS
+    if (USE_BLAS_BACKEND) return predict_serial_blas(m, X, n_rows, n_features);
+#endif
     Labels out(n_rows);
     for (int i = 0; i < n_rows; ++i) {
         const float* xi = &X[static_cast<size_t>(i) * n_features];
@@ -459,6 +850,9 @@ static Labels predict_parallel(const MLPModel& m,
                                const std::vector<float>& X,
                                int n_rows,
                                int n_features) {
+#if MLP_HAS_CBLAS
+    if (USE_BLAS_BACKEND) return predict_parallel_blas(m, X, n_rows, n_features);
+#endif
     Labels out(n_rows);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(N_THREADS)
@@ -503,6 +897,9 @@ static MLPModel train_serial(const std::vector<float>& X,
                              int epochs,
                              double lr,
                              double lambda) {
+#if MLP_HAS_CBLAS
+    if (USE_BLAS_BACKEND) return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
+#endif
     MLPModel model;
     init_weights(model, n_features, SEED);
     if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
@@ -568,6 +965,12 @@ static MLPModel train_parallel_omp(const std::vector<float>& X,
                                    int epochs,
                                    double lr,
                                    double lambda) {
+#if MLP_HAS_CBLAS
+    // For this 128-row mini-batch regime, slicing the batch across outer
+    // threads leaves each worker with panels that are too small to amortize
+    // BLAS call overhead. Reuse the batch-GEMM trainer instead.
+    if (USE_BLAS_BACKEND) return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
+#endif
     MLPModel model;
     init_weights(model, n_features, SEED);
     if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
@@ -795,6 +1198,11 @@ static MLPModel train_parallel_pthreads(const std::vector<float>& X,
                                         int epochs,
                                         double lr,
                                         double lambda) {
+#if MLP_HAS_CBLAS
+    // Same reasoning as train_parallel_omp(): the BLAS backend wants the full
+    // 128-row mini-batch, not N_THREADS tiny slices plus extra barriers.
+    if (USE_BLAS_BACKEND) return train_serial_blas(X, y, n_rows, n_features, epochs, lr, lambda);
+#endif
     MLPModel model;
     init_weights(model, n_features, SEED);
     if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
@@ -877,7 +1285,25 @@ int main(int argc, char* argv[]) {
         int n = std::atoi(env);
         if (n >= 1) N_THREADS = n;
     }
-    if (BATCH % N_THREADS != 0) {
+    if (const char* env = std::getenv("MLP_BLAS_BLOCK")) {
+        int n = std::atoi(env);
+        if (n >= 1) BLAS_PRED_BLOCK = n;
+    }
+    if (const char* env = std::getenv("MLP_BACKEND")) {
+        const std::string backend(env);
+        if (backend == "loop" || backend == "cpp" || backend == "pure") {
+            USE_BLAS_BACKEND = false;
+        } else if (backend == "blas" || backend == "blas-batch" || backend == "gemm") {
+#if MLP_HAS_CBLAS
+            USE_BLAS_BACKEND = true;
+#else
+            USE_BLAS_BACKEND = false;
+            std::cerr << "Warning: MLP_BACKEND=blas requested, but this binary "
+                      << "was not compiled with MLP_USE_BLAS; using sample-loop.\n";
+#endif
+        }
+    }
+    if (!USE_BLAS_BACKEND && BATCH % N_THREADS != 0) {
         std::cerr << "Error: BATCH (" << BATCH << ") must be divisible by N_THREADS ("
                   << N_THREADS << "). The pthreads trainer slices BATCH evenly.\n";
         return 1;
@@ -891,7 +1317,13 @@ int main(int argc, char* argv[]) {
               << "  lr=" << lr
               << "  lambda=" << lambda
               << "  momentum=" << MOMENTUM
-              << "  threads=" << N_THREADS << "\n\n";
+              << "  threads=" << N_THREADS
+              << "  backend=" << active_backend_name();
+#if MLP_HAS_CBLAS
+    std::cout << "  blas_provider=" << blas_provider_name()
+              << "  blas_block=" << BLAS_PRED_BLOCK;
+#endif
+    std::cout << "\n\n";
 
     const double t0 = now_ms();
     Dataset ds = load_dataset(train_csv, test_csv);

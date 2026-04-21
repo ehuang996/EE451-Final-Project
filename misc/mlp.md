@@ -19,6 +19,12 @@ of memory traffic), so the parallel work isn't memory-bandwidth-starved.
 The MLP's 8-core speedup number is therefore the **headline empirical claim**
 of the paper.
 
+That statement still describes the original pure C++ sample-loop backend. The
+current implementation also has an optional vendor-BLAS backend that rewrites
+each minibatch as dense matrix multiplies. That BLAS path is now the
+performance-oriented design and the right counterfactual against sklearn's own
+BLAS-backed `MLPClassifier`.
+
 ---
 
 ## 2. Architecture
@@ -98,11 +104,24 @@ N_THREADS  = 8     (matched to SLURM --cpus-per-task=8)
 SEED       = 42
 ```
 
-`static_assert(BATCH % N_THREADS == 0)` enforces the even-slicing invariant
-used by the pthreads trainer. `N_THREADS` and the algorithm-internal
+`main()` enforces the even-slicing invariant for the sample-loop pthreads
+trainer. `N_THREADS` and the algorithm-internal
 hyperparameters (`H1`, `H2`, `BATCH`, `MOMENTUM`, `SEED`) stay `constexpr`;
 `epochs`, `lr`, and `lambda` are runtime parameters so the CLI signature
 (`./mlp train test [epochs] [lr] [lambda]`) matches SVM.
+
+Runtime backend controls:
+
+- `N_THREADS=<n>`: thread budget for the sample-loop OpenMP / pthread paths.
+- `MLP_BACKEND=loop|cpp|pure`: force the original per-sample C++ backend.
+- `MLP_BACKEND=blas|blas-batch|gemm`: force the vendor-BLAS backend (only when
+  compiled with `MLP_USE_BLAS` or `MLP_USE_MKL`).
+- `MLP_BLAS_BLOCK=<rows>`: prediction block size for the BLAS inference path
+  (`512` by default).
+
+The `BATCH % N_THREADS == 0` restriction now applies only to the sample-loop
+pthreads trainer. The BLAS backend trains on the full 128-row minibatch and
+does not require even slicing.
 
 ---
 
@@ -177,177 +196,212 @@ Skipped columns pass through normalization unchanged (implemented by setting
 `mean = 0, sd = 1` for those columns, so the common normalize loop works
 uniformly). The loader prints a one-line summary:
 `Normalize: <N> z-scored, <K> passthrough (binary/one-hot)` — at 103
-features on the CS:GO dataset, expect `94 z-scored, 9 passthrough`
-(bomb_planted + 8 map_* one-hots).
+features on the current cleaned CSVs, expect `72 z-scored, 31 passthrough`.
 
 ---
 
-## 5. Training — three variants
+## 5. Two execution backends
 
-All three trainers share the same forward/backward kernel (`forward_sample`,
-`backward_sample`) and differ only in the outer structure. Serial and
-parallel run the **same algorithm** (mini-batch SGD + momentum + decaying LR),
-so the speedup ratio measures parallelization overhead, not algorithm
-improvement.
+The file now exposes the same public entry points (`train_serial`,
+`train_parallel_omp`, `train_parallel_pthreads`, `predict_serial`,
+`predict_parallel`) over two different inner kernels:
 
-### 5a. `train_serial` — mini-batch SGD + Polyak momentum + decaying LR
+1. **Sample-loop backend**: the original pure C++ implementation.
+2. **BLAS batch backend**: optional, compiled with `MLP_USE_BLAS` /
+   `MLP_USE_MKL`, and enabled by default when CBLAS is present.
 
-`η_t = LR / √(epoch + 1)` + momentum update `v ← β·v + g/B`,
-`w ← (1 − η·λ)·w − η·v`. The single serial baseline; the `train_better_serial`
-variant from an earlier draft was removed — the "better" algorithm is now
-the sole algorithm.
+The model, loss, optimizer, normalization, and metrics are unchanged across
+the two backends. Only the dense linear algebra implementation changes.
 
-### 5b. `train_parallel_omp` — OpenMP data-parallel over the mini-batch
+### 5a. Sample-loop backend (`MLP_BACKEND=loop`)
 
-Matches SVM's `train_parallel` pattern exactly (no `critical`, no mutex):
+This is the original design:
 
-```
-for each mini-batch:
-  zero per-thread gradient buffers (N_THREADS slots, allocated once)
-  #pragma omp parallel for schedule(static) num_threads(N_THREADS)
-  for i in [0, BATCH):
-      tid = omp_get_thread_num()
-      forward + backward into lgW*[tid], lgb*[tid]
-      lloss[tid] += bce(...)
-  # serial reduction
-  for t in [0, N_THREADS):
-      gW* += lgW*[t]; gb* += lgb*[t]; epoch_loss += lloss[t]
-  sgd_momentum_update(model, gW*, gb*, lambda, lr_t, BATCH)
-```
+- `forward_sample(...)` computes one sample at a time into stack-local
+  `a1[H1]`, `a2[H2]`.
+- `backward_sample(...)` accumulates one sample's contribution into flat
+  gradient buffers.
+- `train_parallel_omp(...)` uses per-thread gradient buffers plus one serial
+  reduction over `N_THREADS`.
+- `train_parallel_pthreads(...)` uses mutex + two barriers per minibatch.
 
-Why no `#pragma omp critical`? The post-loop serial reduction over 8 threads
-and ~9K doubles is ~70 KB to sum — fast enough that a single-threaded pass
-beats spin-waiting on a critical section. Matches the SVM convention
-directly.
+This path is still the portable no-dependency baseline and still matters for
+the writeup because it isolates what plain C++ + OpenMP/pthreads can do
+without any vendor math library.
 
-### 5c. `train_parallel_pthreads` — MLP-specific, mutex + two barriers
+### 5b. BLAS batch backend (`MLP_BACKEND=blas`)
 
-Kept alongside the OMP variant so the writeup has **two parallel
-implementations of the same algorithm** to compare — a direct result of the
-earlier design decision. Uses the classic mutex + barrier pattern:
+The BLAS path stops thinking in terms of one sample at a time and instead
+treats each minibatch as dense row-major matrices:
 
-```cpp
-struct MLPParState {
-    const std::vector<float>* X;  const Labels* y;
-    int n_rows, n_features;       MLPModel* model;
-    std::vector<int> idx;         int batch_start;  double epoch_loss;
-    std::vector<double> gW1, gb1, gW2, gb2, gW3, gb3;  double shared_loss;
-    double lr, lambda;
-    pthread_mutex_t   mutex;
-    pthread_barrier_t barrier_acc;
-    pthread_barrier_t barrier_upd;
-    unsigned seed;  int epochs;
-};
+```text
+Xb : [B x F]   minibatch features  (B=128, F=103)
+A1 : [B x H1]  hidden layer 1 activations
+A2 : [B x H2]  hidden layer 2 activations
+Z3 : [B x 1]   output logits
 ```
 
-Per epoch:
-- **(Thread 0 only)** reshuffle `idx` with `mt19937(SEED + epoch)`;
-  reset `batch_start`, `epoch_loss`.
-- `barrier_upd` — all threads wait for the shuffle before they start.
+Forward pass:
 
-Per mini-batch:
-1. Each thread computes forward + backward on its fixed slice
-   `[tid · 16, (tid+1) · 16)` of the batch into stack-local gradient buffers.
-2. `mutex_lock` → add locals to shared `st->gW*` → `mutex_unlock`.
-3. `barrier_acc` — all threads have contributed their gradient.
-4. **(Thread 0 only)** `sgd_momentum_update`; zero shared grads;
-   advance `batch_start`.
-5. `barrier_upd` — no thread starts next batch's forward pass before
-   weights are written.
+```text
+A1 = ReLU(Xb * W1^T + b1)
+A2 = ReLU(A1 * W2^T + b2)
+Z3 = A2 * W3 + b3
+```
 
-**Why two barriers?** `barrier_acc` protects against "thread 0 reads the
-shared gradient before thread N has locked-and-added its contribution".
-`barrier_upd` protects against "thread N starts the next batch's forward
-pass against a half-updated weight vector".
+Backward pass:
+
+```text
+DZ3 = sigmoid(Z3) - T
+gW3 = A2^T * DZ3
+D2  = (DZ3 * W3^T) o 1[A2 > 0]
+gW2 = D2^T * A1
+D1  = (D2  * W2   ) o 1[A1 > 0]
+gW1 = D1^T * Xb
+```
+
+Implementation details:
+
+- Inputs remain `float` in `Dataset`, but each minibatch is packed once into a
+  contiguous `double` buffer (`pack_indexed_batch_double`) so the weight
+  matrices and gradients stay in `double`.
+- `forward_batch_blas(...)` uses `cblas_dgemm` for `Xb * W1^T` and
+  `A1 * W2^T`, then `cblas_dgemv` for `A2 * W3`.
+- `backward_batch_blas(...)` uses one `dgemv` and three `dgemm` calls plus
+  cheap pointwise ReLU masks and column sums.
+- `MLPBlasWorkspace` owns reusable `A1`, `A2`, `Z3`, `DZ3`, `D2`, and `D1`
+  buffers so the batch path allocates once and reuses memory every minibatch.
+
+### Why the BLAS path does not slice the minibatch across outer threads
+
+The first implementation attempt kept the old outer-threading structure and
+gave each worker `BATCH / N_THREADS` rows. On this network that means
+`16 x 103`, `16 x 64`, and `16 x 32` panels at `N_THREADS=8`, which is too
+small to amortize BLAS-call overhead or extra barriers. The result was slower
+than just handing the full 128-row minibatch to the vendor kernel.
+
+So the current dispatch is deliberate:
+
+- `train_serial(...)` calls `train_serial_blas(...)` when BLAS is enabled.
+- `train_parallel_omp(...)` and `train_parallel_pthreads(...)` also call
+  `train_serial_blas(...)` when BLAS is enabled.
+
+That means the BLAS backend keeps the three public result blocks for CSV /
+parser compatibility, but all three training variants intentionally reuse the
+same dense batch kernel.
 
 ### Why mini-batch, not full-batch or per-sample?
 
-- **Full-batch** on 97,929 samples: one update per epoch — poor convergence,
-  and only `MAX_EPOCHS` parallel regions per run is not enough to amortize
-  thread spin-up.
-- **Per-sample (batch=1)**: every sample requires synchronization →
-  sync dominates compute, speedup collapses.
-- **batch=128** gives ~765 parallel sections per epoch × 30 epochs ≈ 23K
-  chances to amortize, and each section does ~128 × 17K FLOPs ≈ 2.2M FLOPs
-  of compute — way more than barrier cost.
-
-Note: SVM uses **full-batch** gradient descent (`train_parallel` is one update
-per epoch over the full 97,929 rows). KNN doesn't train at all — it's a lazy
-learner that stores the training set and does all work at inference time.
-The MLP using mini-batch is an intentional algorithm-level difference, not a
-parallelization difference — non-convex BCE loss needs the stochastic noise
-to escape saddle points.
+- **Full-batch** on 97,929 samples: one update per epoch is too coarse for a
+  non-convex problem and doesn't fit the existing SGD+momentum comparison.
+- **Per-sample**: no dense kernel to hand to BLAS and synchronization would
+  dominate.
+- **Batch=128** is large enough to form useful GEMM panels while still
+  matching the tuned hyperparameters already used by the paper and sklearn
+  baseline.
 
 ---
 
 ## 6. Inference
 
-`predict_serial` and `predict_parallel` are identical except for
-`#pragma omp parallel for schedule(static) num_threads(N_THREADS)` on the
-outer sample loop. Each iteration's forward pass is independent (read-only
-access to weights, stack-local activations) → embarrassingly parallel,
-no atomics needed.
+The pure C++ inference path is unchanged: one forward pass per sample, with
+optional OpenMP over the outer test-row loop.
 
-Static scheduling chosen because every sample does the same amount of work
-(no branching in the forward pass), so dynamic scheduling would just add
-atomic-counter overhead.
+The BLAS inference path mirrors training:
 
-Output threshold: `ŷ ≥ 0.5 → +1, else −1` — converts sigmoid output back to
-the SVM-compatible label space, so the shared `evaluate()` works unchanged.
+- `predict_blas_range(...)` packs a contiguous block of test rows into `double`
+  and runs the same batched forward pass used by training.
+- `MLP_BLAS_BLOCK` controls how many test rows are grouped into one BLAS call.
+  Default is `512`.
+- `predict_parallel_blas(...)` parallelizes over prediction blocks with OpenMP
+  when available; otherwise it falls back to the serial batched path.
 
----
-
-## 7. Why MLP should out-scale SVM (for the writeup)
-
-**Arithmetic intensity comparison** (FLOPs per byte of input data loaded):
-
-| Algorithm | Inner kernel             | FLOPs / sample | Bytes / sample | AI (FLOP/byte) |
-|-----------|--------------------------|---------------:|---------------:|---------------:|
-| SVM       | `dot(w, x)` + margin check | ~210          | 412            | ~0.5           |
-| MLP       | forward + backward         | ~17,400       | 412            | ~42            |
-
-(`412 = 103 × 4` bytes, X is stored as `float` post-refactor.)
-
-~80× higher arithmetic intensity. The MLP does far more compute per byte of
-memory traffic, so eight threads each running GEMM-style inner loops aren't
-competing for memory bandwidth. SVM is closer to memory-bound — its observed
-speedup ceiling should sit below MLP's on the same 8-core machine.
+Prediction threshold stays `logit >= 0 -> +1 else -1`, which is equivalent to
+`sigmoid >= 0.5` and avoids one redundant sigmoid during inference.
 
 ---
 
-## 8. Numerical & correctness risks (documented for debugging)
+## 7. Why the BLAS backend helps
 
-1. **Sigmoid saturation** — `log(sigmoid(z))` overflows at |z| > 36. Use the
-   logit-form BCE (already done).
-2. **Exploding gradients** at LR=0.01 — if epoch 0 prints `loss=nan`, drop LR
-   to 0.005 via `./mlp ... 30 0.005`. Weight init should prevent this but
-   verify.
-3. **Non-deterministic reductions** — OpenMP's serial post-loop reduction and
-   the pthreads mutex-protected reduction both accumulate in the order
-   threads arrive, which differs per run. The final accuracy is stable
-   (to ±0.005), but printed per-epoch loss will differ in the ~5th decimal
-   place. Do **not** diff loss lines of two parallel runs — they will never
-   match bitwise.
-4. **Shuffle reproducibility** — only thread 0 reshuffles the index array,
-   and does so with `mt19937(SEED + epoch)` so the shuffle is deterministic
-   across runs. If another thread also shuffles, parallel-vs-serial
-   comparison becomes meaningless.
-5. **Speedup numerator** — the summary compares `train_serial` against the
-   two parallel variants. All three use the same algorithm (mini-batch SGD +
-   momentum + decaying LR), so the ratio measures parallelization only —
-   not algorithm-level convergence differences.
+The original sample-loop MLP already had high arithmetic intensity compared to
+SVM:
+
+| Algorithm | Inner kernel                | FLOPs / sample | Bytes / sample | AI (FLOP/byte) |
+|-----------|-----------------------------|---------------:|---------------:|---------------:|
+| SVM       | `dot(w, x)` + margin check  | ~210           | 412            | ~0.5           |
+| MLP       | forward + backward          | ~17,400        | 412            | ~42            |
+
+But arithmetic intensity alone is not enough. The pure backend still executes
+those FLOPs through many small scalar-ish loops and reductions. sklearn's
+`MLPClassifier`, by contrast, already routes its dense layers through BLAS via
+NumPy / `safe_sparse_dot`.
+
+The new backend closes that implementation gap:
+
+- our model math is unchanged;
+- the dense work is now presented to the CPU as GEMM/GEMV panels;
+- the vendor library handles register blocking, cache tiling, and SIMD;
+- we avoid the failed design of wrapping tiny outer slices around already-fast
+  BLAS kernels.
+
+### Local head-to-head (same machine)
+
+On the local macOS Accelerate build:
+
+- **our BLAS backend**: `2.236 s` train, `4.89 ms` infer, `0.7773` accuracy
+  (`VECLIB_MAXIMUM_THREADS=8`, `N_THREADS=8`);
+- **sklearn MLP**: `5.182 s` train, `5.22 ms` infer, `0.7546` accuracy
+  (`N_THREADS=8`, same dataset / matched hyperparameters).
+
+So the improvement is not "our hand-written scalar loops beat sklearn." The
+actual claim is narrower and more defensible:
+
+> once the same vendor-BLAS inner-kernel quality is available to our C++
+> implementation, the remaining estimator overhead is small enough that our
+> MLP can beat sklearn locally on this benchmark.
+
+One more nuance: for MLP, unlike KNN, the best local configuration was **not**
+"outer threads + BLAS threads pinned to 1." The training backend wants the
+vendor library to own the dense kernel. That is why the MLP SLURM script now
+hands the CPU budget to BLAS instead of forcing single-threaded BLAS.
 
 ---
 
-## 9. Build & run
+## 8. Numerical and runtime risks
 
-On USC CARC (from src/cpp/mlp/):
+1. **Sigmoid saturation**: handled by the logit-form BCE already in the code.
+2. **Exploding gradients**: still possible if `lr` is pushed well above `0.01`.
+3. **Nested parallelism / oversubscription**: the failed outer-sliced BLAS
+   path was removed for exactly this reason. Do not reintroduce per-thread
+   minibatch slices on top of threaded BLAS unless layer sizes change enough
+   to justify it.
+4. **Backend mismatch**: `MLP_BACKEND=blas` on a pure build prints a warning
+   and falls back to `sample-loop`.
+5. **Parity expectations**: sample-loop and BLAS backends should stay within
+   the same accuracy band. The exact per-epoch loss text can still differ
+   slightly because the reduction order changes.
+
+---
+
+## 9. Build and run
+
+On USC CARC (from `src/cpp/mlp/`):
 
 ```bash
 cd src/cpp/mlp && sbatch job_mlp.sl
-# outputs to mlpjob.out (separate from SVM's gpujob.out, KNN's knnjob.out,
-# DT's dtjob.out)
-# compiles mlp.cpp, runs ./mlp ../../../data/train_cleaned.csv ../../../data/test_cleaned.csv
+USE_MLP_BLAS=1 sbatch job_mlp.sl
+```
+
+The BLAS job path accepts:
+
+- `MLP_BLAS_CFLAGS` (for example `-DMLP_USE_MKL`)
+- `MLP_BLAS_LIBS`   (for example the oneMKL or OpenBLAS link flags)
+- `MLP_THREADS`     (defaults to `N_THREADS` or `SLURM_CPUS_PER_TASK`)
+
+The consolidated sweep script also supports:
+
+```bash
+USE_MLP_BLAS=1 sbatch slurm/job_sweep.sl
 ```
 
 CLI:
@@ -357,36 +411,44 @@ CLI:
 # defaults: data/train_cleaned.csv  data/test_cleaned.csv  30  0.01  1e-4
 ```
 
-Locally (macOS), from the repo root:
+Local build examples from the repo root:
 
 ```bash
-# Option A: Homebrew libomp with Apple Clang
-brew install libomp
-clang++ -std=c++17 -O3 -march=native \
-  -Xpreprocessor -fopenmp -lomp src/cpp/mlp/mlp.cpp -o mlp -lpthread
-./mlp data/train_cleaned.csv data/test_cleaned.csv
+# Pure C++
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
 
-# Option B: Homebrew GCC (matches CARC's g++ exactly)
-brew install gcc
-g++-14 -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
+# Linux / OpenBLAS
+g++ -std=c++17 -O3 -march=native -fopenmp -DMLP_USE_BLAS \
+  src/cpp/mlp/mlp.cpp -o mlp -lpthread -lopenblas
+
+# macOS / Accelerate
+clang++ -std=c++17 -O3 -DMLP_USE_BLAS \
+  src/cpp/mlp/mlp.cpp -o mlp -lpthread -framework Accelerate
 ```
 
-**Apple Clang alone will not work** — it lacks an OpenMP runtime, and
-`pthread_barrier_t` is an optional POSIX feature that macOS does not
-implement. On a mismatched-Xcode-CLT Mac (e.g. Xcode 13 against macOS 26)
-even simple `<iostream>` includes fail to compile, at which point the only
-option is CARC.
+For oneMKL, compile with `-DMLP_USE_MKL` and the link line from Intel's MKL
+Link Advisor.
 
-### Verification expected
+Runtime examples:
 
-- **Accuracy**: `acc ∈ [0.76, 0.80]` on test set for all three trainers.
-- **Loss**: monotone-ish decrease per epoch (some oscillation from mini-batch
-  noise is normal).
-- **Parity**: `|acc_serial − acc_omp| < 0.01` and
-  `|acc_serial − acc_pthreads| < 0.01`. `main()` prints these deltas at the
-  end of every run.
-- **Speedup**: `serial_total / omp_total > 1` and
-  `serial_total / pthreads_total > 1`. Target 4–6× on 8 cores.
+```bash
+# Recommended BLAS-backed run on macOS
+VECLIB_MAXIMUM_THREADS=8 N_THREADS=8 ./mlp data/train_cleaned.csv data/test_cleaned.csv
+
+# Force the original pure backend from a BLAS-compiled binary
+MLP_BACKEND=loop N_THREADS=8 ./mlp data/train_cleaned.csv data/test_cleaned.csv
+
+# Tune BLAS prediction blocking
+MLP_BLAS_BLOCK=1024 ./mlp data/train_cleaned.csv data/test_cleaned.csv
+```
+
+Verification targets:
+
+- **Accuracy**: `acc` stays in the `0.76-0.80` band on the full test split.
+- **Parity**: `|acc_serial - acc_omp| < 0.01` and
+  `|acc_serial - acc_pthreads| < 0.01`.
+- **Backend fallback**: `MLP_BACKEND=loop` on a BLAS build reproduces the old
+  sample-loop behavior.
 
 ---
 
@@ -396,26 +458,30 @@ Append one row per CARC run. Format:
 
 | date (UTC) | git SHA | epochs | batch | machine/cores | serial (s) | omp (s) | pth (s) | acc_serial | acc_omp | acc_pth | speedup_omp | speedup_pth | notes |
 |------------|---------|:------:|:-----:|---------------|-----------:|--------:|--------:|:----------:|:-------:|:-------:|:-----------:|:-----------:|-------|
-| 2026-04-20 | 526bb18 | 30 | 128 | CARC d17-03 / 8 | 42.01 | 9.24 | 9.09 | 0.7748 | 0.7748 | 0.7727 | 4.55× | 4.62× | Full `{1,2,4,8}` sweep, job 3272373. Accuracy matches proposal target; 4.6× lags the hypothesis's "highest of five." Root cause: H1=64, H2=32 is too small — inner matmuls (128×103, 128×64) leave compute intensity below the threshold where BLAS-style parallelism dominates barrier overhead. KNN outscales at 6.26×. See [results/results.md](../results/results.md). |
+| 2026-04-20 | 526bb18 | 30 | 128 | CARC d17-03 / 8 | 42.01 | 9.24 | 9.09 | 0.7748 | 0.7748 | 0.7727 | 4.55× | 4.62× | Full `{1,2,4,8}` sweep, job 3272373. This is the original pure sample-loop backend. Accuracy matches target, but KNN outscaled it. See [results/results.md](../results/results.md). |
+
+Latest local BLAS notes (same-machine checks after the vendor-BLAS rewrite):
+
+- `MLP_USE_BLAS` + Accelerate, `VECLIB_MAXIMUM_THREADS=8`, `N_THREADS=8`:
+  serial `2.241 s`, OMP `2.268 s`, pthreads `2.242 s`, all at `0.7773`
+  accuracy with exact parity.
+- Same source tree, pure sample-loop build from the earlier local run:
+  serial `22.323 s`, pthreads `6.341 s` on the full dataset.
+- sklearn `MLPClassifier` with matched hyperparameters on the same machine:
+  train `5.182 s`, infer `5.22 ms`, accuracy `0.7546`.
 
 ---
 
-## 11. Followups (known work deferred)
+## 11. Followups
 
-- **Deduplicate loader/metrics** into `common.hpp` once `analytics_engine.cpp`
-  is being written. The refactor just done aligned MLP's `Dataset`,
-  `load_dataset`, `evaluate`, and `print_results` to match SVM/KNN byte-for-
-  byte, so the eventual extraction is mechanical.
-- **Mini-batch size sweep** — the writeup may want a BATCH ∈ {32, 64, 128,
-  256, 512} scan to show how batch size trades off synchronization overhead
-  against gradient noise. Cheap to run, adds a figure. Needs `BATCH` moved
-  from `constexpr` to a CLI arg.
-- **Thread count sweep** — the full speedup curve S(P) for P ∈ {1, 2, 4, 8}
-  is the most informative figure for the paper. Requires parameterizing
-  `N_THREADS` at the CLI rather than hardcoding it at top-of-file.
-- **Cache-blocked GEMM** — not needed at current layer widths
-  (W1 fits in L1d = 64 KB on CARC's Skylake/Cascade Lake nodes). Would only
-  matter if H1 ≥ 512.
-- **SIMD hinting** — `-O3 -march=native` already auto-vectorizes the inner
-  dot products; explicit `#pragma omp simd` on the `j` loops inside
-  `forward_sample` might squeeze another 10–20% but is not required.
+- **Rerun CARC sweep with `USE_MLP_BLAS=1`** so the paper has cluster numbers
+  for the new backend instead of only the original sample-loop row.
+- **Per-algorithm BLAS env in `analytics_engine.cpp`** if we want one sweep to
+  optimize KNN (`BLAS threads = 1`) and MLP (`BLAS threads = N_THREADS`)
+  simultaneously.
+- **Float / SGEMM experiment**: the current BLAS path keeps weights and
+  gradients in `double`. A float-weight path may be faster if accuracy stays
+  stable.
+- **Shared loader/metrics extraction** into a common header remains
+  mechanical; the MLP file already follows the same `Dataset` / `Metrics` /
+  `print_results` conventions as SVM, KNN, DT, and NB.

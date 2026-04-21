@@ -35,7 +35,14 @@ if [[ "${USE_KNN_BLAS:-0}" == "1" ]]; then
 else
     g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
 fi
-g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
+if [[ "${USE_MLP_BLAS:-0}" == "1" ]]; then
+    module load openblas 2>/dev/null || true
+    : "${MLP_BLAS_CFLAGS:=-DMLP_USE_BLAS}"
+    : "${MLP_BLAS_LIBS:=-lopenblas}"
+    g++ -std=c++17 -O3 -march=native -fopenmp $MLP_BLAS_CFLAGS src/cpp/mlp/mlp.cpp -o mlp -lpthread $MLP_BLAS_LIBS
+else
+    g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
+fi
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/dt/dt.cpp   -o dt  -lpthread
 g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/nb/nb.cpp   -o nb  -lpthread
 g++ -std=c++17 -O3 -march=native analytics_engine.cpp -o analytics_engine
@@ -50,8 +57,19 @@ rm -f src/sklearn_xgb/results.csv src/sklearn_xgb/results.json
 # ----------------------------------------------------------------------------
 for T in "${THREAD_COUNTS[@]}"; do
     echo "=== C++ sweep: N_THREADS=$T ==="
+    # KNN's BLAS backend wants outer query parallelism with BLAS pinned to 1.
+    # MLP's BLAS backend wants the opposite: give the full thread budget to
+    # the vendor library. If both are enabled together, prioritize KNN's
+    # setting here and rerun an MLP-only sweep when you want best MLP timing.
     if [[ "${USE_KNN_BLAS:-0}" == "1" ]]; then
         OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 \
+            N_THREADS=$T ./analytics_engine \
+            data/train_cleaned.csv \
+            data/test_cleaned.csv \
+            "analytics_results_t${T}.csv"
+    elif [[ "${USE_MLP_BLAS:-0}" == "1" ]]; then
+        OMP_NUM_THREADS=$T OPENBLAS_NUM_THREADS=$T MKL_NUM_THREADS=$T \
+        BLIS_NUM_THREADS=$T VECLIB_MAXIMUM_THREADS=$T \
             N_THREADS=$T ./analytics_engine \
             data/train_cleaned.csv \
             data/test_cleaned.csv \

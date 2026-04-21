@@ -16,9 +16,9 @@ How each sklearn/XGBoost baseline in [src/sklearn_xgb/compare.py](../src/sklearn
 
 ## MLP
 
-- **Ours**: 103→64→32→1, ReLU/sigmoid BCE, SGD+momentum 0.9, batch=128, 30 epochs, `lr=0.01`, invscaling.
+- **Ours**: 103→64→32→1, ReLU/sigmoid BCE, SGD+momentum 0.9, batch=128, 30 epochs, `lr=0.01`, invscaling. Default pure backend is explicit sample-loop C++; an optional `MLP_USE_BLAS` build rewrites each minibatch as vendor-BLAS GEMMs.
 - **sklearn**: `MLPClassifier(hidden_layer_sizes=(64,32), solver="sgd", momentum=0.9, nesterovs_momentum=False, batch_size=128, max_iter=30, learning_rate="invscaling", power_t=0.5)`. Architecturally and hyperparametrically aligned.
-- **Key difference**: **sklearn's parallelism is implicit via BLAS**, not explicit threading — `OMP_NUM_THREADS=N_THREADS` is pinned before `numpy` is imported so the BLAS matmuls use the same thread budget as our explicit OpenMP. That's the apples-to-apples move.
+- **Key difference**: sklearn's parallelism is implicit via BLAS. Our pure backend uses explicit OpenMP/pthreads; the optional BLAS backend closes the inner-kernel gap by using the same vendor-BLAS style on the C++ side.
 
 ## DT (two baselines)
 
@@ -40,7 +40,7 @@ How each sklearn/XGBoost baseline in [src/sklearn_xgb/compare.py](../src/sklearn
 |---|---|---|
 | SVM threading | OMP + pthreads | Single-threaded only |
 | KNN threading | OMP + pthreads | `n_jobs` (joblib) |
-| MLP threading | OMP + pthreads (explicit) | Implicit via BLAS (`OMP_NUM_THREADS`) |
+| MLP threading | Sample-loop: OMP + pthreads; optional BLAS batch backend | Implicit via BLAS (`OMP_NUM_THREADS`) |
 | DT threading | OMP + pthreads | sklearn single-threaded; XGBoost `n_jobs` |
 | DT algorithm | Histogram CART | sklearn=exact, XGBoost=hist |
 | NB | Hybrid mixed-likelihood | No native equivalent — `hybrid_nb.py` composes it |
