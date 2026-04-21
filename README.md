@@ -24,20 +24,22 @@ matches (2019–2020). Binary target `round_winner ∈ {CT, T}`. After one-hot
 encoding the map feature, each record has 103 numeric features.
 
 - 80/20 train/test split: 97,929 training rows, 24,483 test rows.
-- Cleaned CSVs at repo root: [train_cleaned.csv](train_cleaned.csv),
-  [test_cleaned.csv](test_cleaned.csv).
+- Cleaned CSVs live under [data/](data/): [data/train_cleaned.csv](data/train_cleaned.csv),
+  [data/test_cleaned.csv](data/test_cleaned.csv). Raw pre-cleaning splits
+  also live under `data/` (`cs_go_winner_data_{train,test}.csv`).
 - Community benchmark accuracy: 76–80%.
 
 ## Algorithms
 
-| Algorithm              | File                       | Status       | Owner   |
-|------------------------|----------------------------|--------------|---------|
-| Support Vector Machine | [svm/svm.cpp](svm/svm.cpp) | Complete     | Harry   |
-| Multilayer Perceptron  | [mlp/mlp.cpp](mlp/mlp.cpp) | Complete     | Eric    |
-| K-Nearest Neighbors    | `knn/knn.cpp` (TBD)        | Not started  | —       |
-| Naive Bayes            | `nb/nb.cpp`   (TBD)        | Not started  | —       |
-| Decision Tree          | `dt/dt.cpp`   (TBD)        | Not started  | —       |
-| Benchmark driver       | `analytics_engine.cpp`     | Not started  | —       |
+| Algorithm              | File                                       | Status       | Owner   |
+|------------------------|--------------------------------------------|--------------|---------|
+| Support Vector Machine | [src/cpp/svm/svm.cpp](src/cpp/svm/svm.cpp) | Complete     | Harry   |
+| K-Nearest Neighbors    | [src/cpp/knn/knn.cpp](src/cpp/knn/knn.cpp) | Complete     | Mo      |
+| Multilayer Perceptron  | [src/cpp/mlp/mlp.cpp](src/cpp/mlp/mlp.cpp) | Complete     | Eric    |
+| Decision Tree          | [src/cpp/dt/dt.cpp](src/cpp/dt/dt.cpp)     | Complete     | Eric    |
+| Naive Bayes            | [src/cpp/nb/nb.cpp](src/cpp/nb/nb.cpp)     | Complete     | Eric    |
+| Benchmark driver       | [analytics_engine.cpp](analytics_engine.cpp) | Complete   | Eric    |
+| sklearn/XGBoost baselines | [src/sklearn_xgb/](src/sklearn_xgb/)    | Complete     | Eric    |
 
 All algorithm files expose the same public interface (`load_dataset`,
 `train_serial`, `train_parallel`, `predict_serial`, `predict_parallel`,
@@ -59,41 +61,117 @@ intensity and suitability for SIMD optimizations.
 ├── proposal.tex               Project proposal (LaTeX source)
 ├── README.md                  This file
 ├── CLAUDE.md                  Repo-level conventions for AI assistance
-├── job.sl                     SLURM job script (USC CARC)
+├── job.sl                     SLURM — compiles + runs all five algos
+├── job_analytics.sl           SLURM — runs analytics_engine across all five
+├── analytics_engine.cpp       Master benchmarking driver (subprocess + CSV out)
 ├── split_data.sh              80/20 shuffle-split of the raw Kaggle CSV
-├── train_cleaned.csv          Cleaned training split (97929 × 104)
-├── test_cleaned.csv           Cleaned test split     (24483 × 104)
-├── svm/
-│   ├── svm.cpp                Linear SVM, hinge loss + L2, pthreads trainer
-│   ├── Data.ipynb             Data-cleaning notebook (one-hot maps, labels)
+├── data/
+│   ├── train_cleaned.csv      Cleaned training split (97929 × 104)
+│   ├── test_cleaned.csv       Cleaned test split     (24483 × 104)
 │   └── cs_go_winner_data_{train,test}.csv   Raw pre-cleaning splits
-├── mlp/
-│   └── mlp.cpp                MLP, BCE + L2, OMP + pthreads trainers
+├── src/
+│   ├── cpp/
+│   │   ├── svm/
+│   │   │   ├── svm.cpp        Linear SVM, hinge loss + L2, OMP + pthreads
+│   │   │   ├── job_svm.sl     Per-algo SLURM script (outputs gpujob.out)
+│   │   │   └── Data.ipynb     Data-cleaning notebook (one-hot maps, labels)
+│   │   ├── knn/
+│   │   │   ├── knn.cpp        K-Nearest Neighbors, OMP + pthreads inference
+│   │   │   └── job_knn.sl     Per-algo SLURM script (outputs knnjob.out)
+│   │   ├── mlp/
+│   │   │   ├── mlp.cpp        MLP, BCE + L2, OMP + pthreads trainers
+│   │   │   └── job_mlp.sl     Per-algo SLURM script (outputs mlpjob.out)
+│   │   ├── dt/
+│   │   │   ├── dt.cpp         Decision Tree, histogram CART, OMP + pthreads
+│   │   │   └── job_dt.sl      Per-algo SLURM script (outputs dtjob.out)
+│   │   └── nb/
+│   │       ├── nb.cpp         Naive Bayes, Gaussian+Bernoulli, OMP + pthreads
+│   │       └── job_nb.sl      Per-algo SLURM script (outputs nbjob.out)
+│   └── sklearn_xgb/           sklearn + XGBoost comparison harness (Python)
+│       ├── compare.py
+│       ├── loader.py
+│       ├── hybrid_nb.py
+│       ├── parse_cpp_output.py
+│       ├── job_compare.sl     SLURM — builds C++ + runs Python baselines
+│       ├── requirements.txt
+│       └── README.md
 └── misc/
-    └── mlp.md                 MLP design doc + per-run results log
+    ├── mlp.md                 MLP design doc + per-run results log
+    ├── dt.md                  DT design doc + per-run results log
+    └── nb.md                  NB design doc + per-run results log
 ```
 
 ## Build & run
 
 ### USC CARC (primary)
 
+Run all five algorithms in one job (from the repo root):
+
 ```bash
-sbatch job.sl
+sbatch job.sl       # outputs combined run to alljob.out
 ```
 
-Compiles and runs both `svm` and `mlp` against the cleaned CSVs. Output goes
-to `gpujob.out`. SLURM config: 8 CPU cores, 16 GB memory, 1-hour wall time.
+Or run one algorithm at a time (useful when iterating on a single algo).
+Run from that algo's own folder so output files land next to the source:
+
+```bash
+(cd src/cpp/svm && sbatch job_svm.sl)   # outputs gpujob.out in src/cpp/svm/
+(cd src/cpp/knn && sbatch job_knn.sl)   # outputs knnjob.out in src/cpp/knn/
+(cd src/cpp/mlp && sbatch job_mlp.sl)   # outputs mlpjob.out in src/cpp/mlp/
+(cd src/cpp/dt  && sbatch job_dt.sl)    # outputs dtjob.out  in src/cpp/dt/
+(cd src/cpp/nb  && sbatch job_nb.sl)    # outputs nbjob.out  in src/cpp/nb/
+```
+
+For the consolidated benchmark CSV used by the writeup, run the analytics
+engine — it invokes each algorithm as a subprocess, parses their `[tag]`
+output blocks, and emits `analytics_results.csv`:
+
+```bash
+sbatch job_analytics.sl     # outputs to analyticsjob.out
+# produces analytics_results.csv with columns:
+#   algorithm,variant,n_threads,train_ms,infer_ms,total_ms,accuracy,
+#   precision,recall,f1
+```
+
+For the sklearn + XGBoost comparison harness:
+
+```bash
+sbatch src/sklearn_xgb/job_compare.sl   # outputs to src/sklearn_xgb/comparejob.out
+# produces src/sklearn_xgb/results.csv
+```
+
+All SLURM configs: 8 CPU cores, 16 GB memory, 1-hour wall time.
 
 ### Local compile
 
 The build command for each algorithm is intentionally the same so comparisons
-stay apples-to-apples:
+stay apples-to-apples. Run these from the repo root:
 
 ```bash
-g++ -std=c++17 -O3 -march=native -fopenmp svm/svm.cpp -o svm -lpthread
-g++ -std=c++17 -O3 -march=native -fopenmp mlp/mlp.cpp -o mlp -lpthread
-./svm train_cleaned.csv test_cleaned.csv
-./mlp train_cleaned.csv test_cleaned.csv
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/svm/svm.cpp -o svm -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/dt/dt.cpp   -o dt  -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/nb/nb.cpp   -o nb  -lpthread
+./svm data/train_cleaned.csv data/test_cleaned.csv
+./knn data/train_cleaned.csv data/test_cleaned.csv
+./mlp data/train_cleaned.csv data/test_cleaned.csv
+./dt  data/train_cleaned.csv data/test_cleaned.csv
+./nb  data/train_cleaned.csv data/test_cleaned.csv
+```
+
+Each binary's `resolve_path` helper searches `./`, `../`, `data/`, `../data/`,
+`../../data/`, and `../../../data/` — so you can also run them from
+`src/cpp/<algo>/` with no CSV args and they'll still find the data.
+
+CLI signatures (arg 3+ overrides hyperparameters, see each algo's header):
+
+```bash
+./svm train test [epochs] [lr] [lambda]
+./knn train test [k]
+./mlp train test [epochs] [lr] [lambda]
+./dt  train test [max_depth]
+./nb  train test       # no CLI hyperparameters — closed-form MLE
 ```
 
 **macOS note:** Apple Clang ships without OpenMP and the Darwin pthreads
@@ -103,26 +181,30 @@ Easier path: just run on CARC.
 
 ## Output
 
-Each binary prints a box-drawn summary per trainer (serial and parallel
-variants), then a final speedup table. Example MLP summary shape:
+Each binary prints a plain-text `Dataset Info` block, a `[tag]` block per
+trainer with per-model quality metrics (accuracy, precision, recall, F1) and
+system metrics (training time, inference time), and a `Speedup Summary` at
+the end. Example MLP summary shape:
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Speedup Analysis                               │
-├─────────────────────────────────────────────────┤
-│  Serial total           : <T_serial>  ms
-│  Better Serial total    : <T_better>  ms
-│  Parallel OMP total     : <T_omp>     ms
-│  Parallel pthreads total: <T_pth>     ms
-│  Speedup (OMP)          : <S_omp>     x
-│  Speedup (pthreads)     : <S_pth>     x
-│  Threads used           : 8
-└─────────────────────────────────────────────────┘
+Speedup Summary
+  Serial total       : <T_serial>  ms
+  Parallel OMP total : <T_omp>     ms
+  Parallel pth total : <T_pth>     ms
+  Speedup (OMP)      : <S_omp>     x
+  Speedup (pthreads) : <S_pth>     x
 ```
 
-Reported per-model quality metrics: accuracy, precision, recall, F1.
-System metrics: training time, inference time, parallel speedup.
-MLP-specific design & results log in [misc/mlp.md](misc/mlp.md).
+All five algorithms report **two** parallel variants — OpenMP and pthreads —
+plus an accuracy parity check at the end so you can confirm the parallel
+variants produce the same model as serial. The OMP-vs-pthreads comparison
+lets the writeup isolate synchronization-primitive overhead from
+parallelization-strategy overhead.
+
+Algorithm-specific design & results logs:
+- MLP: [misc/mlp.md](misc/mlp.md)
+- DT:  [misc/dt.md](misc/dt.md)
+- NB:  [misc/nb.md](misc/nb.md)
 
 ## References
 

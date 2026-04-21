@@ -1,0 +1,75 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+% The preceding line is only needed to identify funding in the first footnote. If that is unneeded, please comment it out.
+\usepackage{url}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+\begin{document}
+
+\title{An Empirical Study on Parallelization of Classical Machine Learning Methods\\
+{\footnotesize \textsuperscript{*} EE 451 Distributed and Parallel Computing - Final Project Proposal}
+}
+
+\author{
+    \IEEEauthorblockN{Eric Huang, Harry Yang, Jinglu Sun, Mo Jiang, and Pinru Wang}
+    \IEEEauthorblockA{\textit{University of Southern California} \\
+    \{ehuang97, yangyiha, jinglusu, mojiang, pinruwan\}@usc.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+This project presents a from-scratch implementation of five classical machine learning algorithms---K-Nearest Neighbors, Support Vector Machine, Naïve Bayes, Decision Tree, and Multilayer Perceptron---in pure C++17, parallelized using OpenMP and POSIX threads to maximize multi-core CPU utilization on a binary classification task. We conduct a rigorous empirical and analytical benchmarking study on the CS:GO Round Winner Classification dataset \cite{lillelund2020csgo}, investigating how each algorithm's arithmetic intensity and data dependency structure governs its parallel speedup, efficiency, and classification performance as a function of core count.
+\end{abstract}
+
+\begin{IEEEkeywords}
+parallel computing, multi-core optimization, machine learning, OpenMP, pthreads, K-Nearest Neighbors, Support Vector Machine, Decision Tree, Multilayer Perceptron, Naïve Bayes, arithmetic intensity, speedup analysis
+\end{IEEEkeywords}
+
+%-----------------------------------------------------------------------
+\section{Introduction}
+%-----------------------------------------------------------------------
+
+\subsection{Background and Hypothesis}
+
+Modern machine learning frameworks such as scikit-learn and PyTorch provide high-level abstractions that, while convenient, obscure the underlying hardware utilization and introduce substantial runtime overhead \cite{phani2026stratuminfrastructuremassiveagentcentric, buitinck2013apidesignmachinelearning}. Accelerating classical ML algorithms from first principles in a multi-core environment is a non-trivial problem because each algorithm exhibits fundamentally different computational characteristics and data dependency structures \cite{prevparallelMLwork}. For instance, Support Vector Machines (SVM) require iterative optimization procedures with globally shared state \cite{svmsharedstate}, and Multilayer Perceptrons (MLP) involve dense matrix operations whose parallel efficiency is tightly coupled to cache locality \cite{MLPbottleneck}. These varied bottlenecks make it analytically interesting and practically challenging to reason about how each algorithm responds to an increasing number of CPU cores. Consequently, a detailed performance analysis of these algorithms is essential for identifying the precise ceiling of architectural scalability and informing the design of next-generation, hardware-aware optimization strategies.
+
+We hypothesize that while KNN and Naïve Bayes will achieve high initial speedup before hitting memory bandwidth limits, and Decision Trees and SVM will be constrained by synchronization overhead and iterative convergence, MLP will scale most effectively due to its high arithmetic intensity and suitability for SIMD optimizations.
+
+\subsection{Contributions}
+
+Building on previous research into multi-core machine learning optimization \cite{prevparallelMLwork}, this project delivers the following concrete contributions. First, we implement five ML classification algorithms---K-Nearest Neighbors (KNN), Support Vector Machine (SVM), Naïve Bayes (NB), Decision Tree (DT), and Multilayer Perceptron (MLP)---entirely in pure C++17 with no external ML dependencies to examine how specific algorithmic structures influence parallel acceleration. Second, each implementation is parallelized using OpenMP and POSIX threads (pthreads), targeting multi-core CPU architectures with architecture-specific compiler optimizations. Third, we conduct a rigorous empirical and mathematical analysis of each algorithm's Arithmetic Intensity (floating-point operations per byte of memory traffic), quantifying the degree to which each model is compute-bound versus memory-bound and explaining observed scaling behavior. Finally, we provide an integrated benchmarking engine that evaluates all five models on a shared dataset to analyze how parallelization strategies and accuracy trade-offs diverge across different algorithmic frameworks and implementation constraints.
+
+%-----------------------------------------------------------------------
+\section{Description and Technical Approach}
+%-----------------------------------------------------------------------
+
+\subsection{Parallelization Techniques}
+
+We employ two complementary parallelization strategies across our implementations. For data-parallel workloads, we partition the training dataset across available threads so that each thread operates on an independent data partition. This strategy applies directly to KNN distance metric computation and Naïve Bayes class conditional frequency counting, where no inter-thread communication is required during the main computation phase. For task-parallel workloads, we use OpenMP \texttt{\#pragma omp parallel for} directives to distribute independent subtasks such as feature-split evaluation in the Decision Tree and independent weight gradient updates in the MLP. Where shared mutable state is unavoidable---particularly in SVM's global support vector updates---we employ fine-grained locking via pthreads mutexes to manage concurrency safely. A central analytical focus of this project is characterizing each algorithm's Arithmetic Intensity, defined as the ratio of floating-point operations to bytes of memory traffic. This metric determines whether an algorithm is fundamentally compute-bound or memory-bound and directly predicts the practical ceiling of multi-core speedup, since memory-bound algorithms saturate at the memory bandwidth limit regardless of core count.
+
+\subsection{Implementation Platform}
+
+All implementations are written in pure C++17 with no external machine learning libraries. Parallelism is managed through OpenMP for high-level loop-level parallelism and POSIX pthreads for fine-grained threading control. All code is compiled with GCC or Clang using the \texttt{-O3} and \texttt{-march=native} flags to enable auto-vectorization and hardware-specific instruction selection. Experiments will be conducted on a shared multi-core machine to allow systematic scaling analysis across varying core counts.
+
+%-----------------------------------------------------------------------
+\section{Evaluation and Benchmarking}
+%-----------------------------------------------------------------------
+
+\subsection{Dataset and Metrics}
+
+We evaluate all five models on the CS:GO Round Winner Classification dataset \cite{lillelund2020csgo}, which contains 122,411 round snapshots derived from approximately 700 professional tournament matches (2019--2020). Each record consists of 96 pre-processed features spanning team health, economy, equipment, and positional state, with a binary target variable indicating round winner (CT or T). The community benchmark accuracy for this dataset ranges from 76\% to 80\% under the 80-20 train-test split setting, providing a meaningful baseline for validating model correctness. We report both model quality metrics---accuracy, precision, recall, and F1-score---and system performance metrics including inference latency (ms), throughput (snapshots per second), parallel speedup $S = T_{\text{parallel}} / T_{\text{serial}}$, and Arithmetic Density (Ops/byte) measured per model.
+
+\subsection{Deliverables}
+
+The code deliverables consist of the following source files: \texttt{knn.cpp}, \texttt{svm.cpp}, \texttt{nb.cpp}, \texttt{dt.cpp}, and \texttt{mlp.cpp}, each containing a self-contained parallelized implementation of the respective algorithm; and \texttt{analytics\_engine.cpp}, a master benchmarking driver responsible for loading the CS:GO dataset, executing all five models under varying core configurations, and writing performance results to structured CSV files for analysis. A final written report will document the algorithmic or mathematical basis for each parallelization strategy, the empirical speedup curves as a function of core count, and a comparative discussion of why certain algorithms benefit more from multi-core execution than others.
+
+\bibliographystyle{ieeetr}
+\bibliography{references}
+\end{document}

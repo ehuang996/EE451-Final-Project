@@ -1,0 +1,82 @@
+#!/bin/bash
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16GB
+#SBATCH --time=2:00:00
+#SBATCH --output=sweepjob.out
+
+set -e
+
+# ----------------------------------------------------------------------------
+# Thread-scaling sweep: runs every algorithm + framework at
+# N_THREADS ∈ {1, 2, 4, 8}. Produces:
+#   - sweep_results_cpp.csv     (C++ side, from analytics_engine)
+#   - sweep_results_sklearn.csv (sklearn + XGBoost side, from compare.py)
+# one row per (algorithm, variant, n_threads).
+#
+# Run from the repo root: `sbatch job_sweep.sl`.
+# ----------------------------------------------------------------------------
+
+THREAD_COUNTS=(1 2 4 8)
+
+mkdir -p src/sklearn_xgb/logs
+
+# Compile all five C++ binaries + analytics_engine once (same flags everywhere).
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/svm/svm.cpp -o svm -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/knn/knn.cpp -o knn -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/mlp/mlp.cpp -o mlp -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/dt/dt.cpp   -o dt  -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/nb/nb.cpp   -o nb  -lpthread
+g++ -std=c++17 -O3 -march=native analytics_engine.cpp -o analytics_engine
+
+# Clean prior sweep outputs.
+rm -f sweep_results_cpp.csv sweep_results_sklearn.csv
+rm -f src/sklearn_xgb/results.csv src/sklearn_xgb/results.json
+
+# ----------------------------------------------------------------------------
+# C++ side: analytics_engine runs per thread count, emitting its own CSV.
+# Concatenate into one sweep CSV at the end (header from first file only).
+# ----------------------------------------------------------------------------
+for T in "${THREAD_COUNTS[@]}"; do
+    echo "=== C++ sweep: N_THREADS=$T ==="
+    N_THREADS=$T ./analytics_engine \
+        data/train_cleaned.csv \
+        data/test_cleaned.csv \
+        "analytics_results_t${T}.csv"
+done
+
+# Merge: keep header from the first file, skip headers from the rest.
+head -1 "analytics_results_t1.csv" > sweep_results_cpp.csv
+for T in "${THREAD_COUNTS[@]}"; do
+    tail -n +2 "analytics_results_t${T}.csv" >> sweep_results_cpp.csv
+done
+
+# ----------------------------------------------------------------------------
+# sklearn / XGBoost side: compare.py reads N_THREADS env var. Run once per
+# thread count, writing to a per-thread-count CSV, then merge.
+# ----------------------------------------------------------------------------
+module load python/3.11 2>/dev/null || true
+python -m pip install --user -r src/sklearn_xgb/requirements.txt
+
+for T in "${THREAD_COUNTS[@]}"; do
+    echo "=== sklearn sweep: N_THREADS=$T ==="
+    rm -f "src/sklearn_xgb/results_t${T}.csv" "src/sklearn_xgb/results_t${T}.json"
+    N_THREADS=$T python src/sklearn_xgb/compare.py \
+        --train data/train_cleaned.csv \
+        --test  data/test_cleaned.csv \
+        --out-csv  "src/sklearn_xgb/results_t${T}.csv" \
+        --out-json "src/sklearn_xgb/results_t${T}.json"
+done
+
+# Merge sklearn per-thread-count CSVs.
+head -1 "src/sklearn_xgb/results_t1.csv" > sweep_results_sklearn.csv
+for T in "${THREAD_COUNTS[@]}"; do
+    tail -n +2 "src/sklearn_xgb/results_t${T}.csv" >> sweep_results_sklearn.csv
+done
+
+echo ""
+echo "=== sweep_results_cpp.csv (C++ side) ==="
+cat sweep_results_cpp.csv
+echo ""
+echo "=== sweep_results_sklearn.csv (sklearn + XGBoost side) ==="
+cat sweep_results_sklearn.csv

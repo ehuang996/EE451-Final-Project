@@ -1,0 +1,29 @@
+# Compiled binaries (produced at repo root by job.sl / job_*.sl / job_sweep.sl)
+/svm
+/knn
+/mlp
+/dt
+/nb
+/analytics_engine
+
+# SLURM stdout captures
+*.out
+
+# Per-algorithm stdout captures under logs/ dirs
+**/logs/
+
+# Results CSV/JSON produced by analytics_engine / compare.py / job_sweep.sl
+analytics_results*.csv
+sweep_results_*.csv
+src/sklearn_xgb/results*.csv
+src/sklearn_xgb/results*.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS junk
+.DS_Store
+
+# Raw Kaggle dump (never commit — ~50 MB+, not meant to be tracked)
+data/csgo_round_snapshots.csv
