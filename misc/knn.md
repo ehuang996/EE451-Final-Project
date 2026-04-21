@@ -27,17 +27,29 @@ reformulates the distance matrix as a single dense GEMM
 scale ~6.2× from T=1 to T=8; sklearn just starts 16× ahead at T=1. This is the
 paper's central "algorithm vs parallelism" narrative thread.
 
+**Implementation update (2026-04-21).** We moved our KNN kernel from a direct
+single-query squared-distance loop to a cache-blocked dot-product formulation:
+precompute `‖xi‖²`, process 16 test queries at a time, and evaluate distances as
+`‖xq‖² + ‖xi‖² − 2·xq·xi`. This is still pure C++17 plus OpenMP/pthreads, not a
+BLAS dependency. Local targeted pthread timing improved from 24.35 s to 7.83 s
+on the full test split, with the same 0.8104 accuracy. It still does not beat
+sklearn locally; a temporary Accelerate/BLAS prototype reached ~1.8 s vs
+sklearn's ~1.6 s on the same Mac, confirming that the remaining gap is
+vendor-BLAS kernel quality rather than thread dispatch.
+
 ---
 
 ## 2. Algorithm: brute-force k-NN with squared-L2 distance
 
 For each test sample `xq`:
-1. Compute squared-L2 distance to every training sample
-   `d²(xq, xi) = Σⱼ (xq[j] − xi[j])²`.
-2. Track the k smallest distances via an O(k) linear-scan heap kept in
+1. Compute squared-L2 distance to every training sample using the equivalent
+   dot-product identity `d²(xq, xi) = ‖xq‖² + ‖xi‖² − 2·xq·xi`.
+2. Process `QUERY_BLOCK = 16` test samples at a time, so each training row is
+   loaded once and reused across the block.
+3. Track the k smallest distances via an O(k) linear-scan heap kept in
    `best_dist[0..k]` / `best_label[0..k]`. On each new candidate distance less
    than the current worst, replace that slot and rescan for the new max.
-3. Majority-vote among the k labels; on tie, pick the label of the nearest
+4. Majority-vote among the k labels; on tie, pick the label of the nearest
    neighbor.
 
 Stopping conditions: none — single pass over the full training set per query.
@@ -57,6 +69,26 @@ Skipping the per-distance `sqrt()` saves `n_test × n_train = 2.4B` sqrt ops.
 Rank-ordering by `d²` is identical to ordering by `d` (both are monotone), so
 top-k selection is correct. Sklearn's `euclidean` metric does the same
 optimization internally.
+
+### Why the dot-product identity
+
+The original kernel computed `(xq[j] - xi[j])²` directly inside a
+query-major triple loop. That is simple and exact, but it reloads each training
+row separately for every test query. The current kernel precomputes training
+row norms in the model and test row norms per prediction call, transposes a
+small block of 16 test queries into `qbuf`, then streams each training row once
+across all queries in the block:
+
+```cpp
+dist[q] = train_norm[i] + test_norm[q];
+for (int j = 0; j < n_features; ++j)
+    dist[q] += -2.0f * xi[j] * qbuf[j][q];
+```
+
+This is the same formulation sklearn uses before dispatching to BLAS, but our
+implementation remains a hand-written C++ loop rather than a full GEMM kernel.
+It improves cache reuse and vectorization opportunities, but it does not match
+OpenBLAS/MKL/Accelerate's register blocking and assembly microkernels.
 
 ### Tie-breaking on majority vote
 
@@ -103,24 +135,26 @@ struct Dataset {
 Identical to the four other algorithms — `analytics_engine.cpp` can share one
 loader. `float` (not `double`) halves the memory footprint of `X_train`:
 97,929 × 103 × 4 = **40 MB** fits in L3 on Cascade Lake (35 MB+ per socket).
-`double` would be 80 MB and spill to DRAM every query. Accuracy is unaffected
-— the downstream `d²` is accumulated in `double`.
+`double` would be 80 MB and spill to DRAM every query. The current blocked
+dot-product kernel keeps distances in `float`, matching the storage type and
+the BLAS-style formulation we are trying to approximate.
 
 ### `struct KNNModel`
 
 ```cpp
 struct KNNModel {
-    std::vector<float> X;   // copy of X_train — see "Why a copy" below
-    Labels y;                // copy of y_train
+    std::vector<float> X;       // copy of X_train — see "Why a copy" below
+    std::vector<float> norm2;   // precomputed ‖xi‖² for every training row
+    Labels y;                   // copy of y_train
     int n_rows;
     int n_features;
     int k = K_NEIGHBORS;
 };
 ```
 
-KNN is a **lazy learner** — the "model" is just a reference to the training
-data plus `k`. `train_serial` / `train_parallel` are trivial aliases that
-populate this struct; **all actual work happens at inference**.
+KNN is still a **lazy learner** in the ML sense: no parameters are fitted.
+The model stores a copy of the training matrix, labels, `k`, and one additional
+row-norm vector used by the blocked dot-product inference kernel.
 
 **Why a copy (not a pointer) into the model.** The three inference variants
 (serial / OMP / pthreads) each get their own `KNNModel` in `main()`:
@@ -129,19 +163,20 @@ independent — a future refactor could share one underlying pointer, but the
 ~40 MB × 3 = 120 MB memory footprint is negligible, and owning the data inside
 the model cleans up the interface.
 
-### Stack-local top-k heap (the hot data structure)
+### Block-local top-k heap (the hot data structure)
 
 ```cpp
-std::vector<double> best_dist(k, +inf);
-std::vector<int>    best_label(k, 0);
-int    max_idx  = 0;
-double max_dist = best_dist[0];
+std::vector<float> best_dist(QUERY_BLOCK * k, +inf);
+std::vector<int>    best_label(QUERY_BLOCK * k, 0);
+std::vector<int>    max_idx(QUERY_BLOCK, 0);
+std::vector<float>  max_dist(QUERY_BLOCK, +inf);
 ```
 
-For each test query, allocate a tiny k-slot array (k=11, so ~176 B of data +
-vector overhead). Track the current-worst distance (`max_dist` at `max_idx`).
-On each training-row candidate `d² < max_dist`: overwrite the worst slot, then
-scan `best_dist[0..k]` to find the new worst.
+For each block of up to 16 test queries, allocate one contiguous k-slot array
+per query. Track each query's current-worst distance (`max_dist[q]` at
+`max_idx[q]`). On each training-row candidate `d² < max_dist[q]`: overwrite
+the worst slot, then scan that query's `best_dist[q*k..q*k+k]` to find the new
+worst.
 
 This is **O(k)-insert, O(1)-compare-to-worst**, and is faster than
 `std::priority_queue` at k=11 because the O(log k) heap-update has higher
@@ -154,7 +189,7 @@ few hundred candidates).
 
 Identical to SVM/MLP/DT/NB: `map_*`, `bomb_planted`, and auto-detected 0/1
 columns bypass z-score normalization. On CS:GO expect
-`Normalize: 94 z-scored, 9 passthrough` (bomb_planted + 8 map_* one-hots).
+roughly 72 z-scored columns and 31 passthrough binary/one-hot columns.
 
 **Why this matters for KNN specifically.** If map one-hots were z-scored they
 would contribute distance proportional to their class frequency (a rare map
@@ -166,27 +201,26 @@ feature at ~1σ. Cleaner physical interpretation of distance.
 
 ## 5. Training — three variants
 
-KNN is a **lazy learner** — there is no training phase that touches the data
-beyond copying it into the model. All three `train_*` functions are O(n_rows)
-memcpy-equivalents that exist only to keep the API signature consistent across
-the five algorithms.
+KNN is a **lazy learner** — there is no fitted weight vector or tree. Training
+copies data into the model and precomputes one `float` row norm per training
+sample. All `train_*` functions remain O(n_rows · n_features) setup work and
+exist mostly to keep the API signature consistent across the five algorithms.
 
 ### 5a. `train_serial` — copy
 
-Populates the model's `X`, `y`, `n_rows`, `n_features`, `k`. Runs in ~13 ms
-on CS:GO (mostly `std::vector::operator=`). This is the "serial baseline"
-for speedup, but is essentially a constant — the actual speedup numerator is
-**inference time**.
+Populates the model's `X`, `norm2`, `y`, `n_rows`, `n_features`, `k`. The row
+norm pass is small relative to inference, but it is now part of `train_ms` so
+the benchmark accounts for the optimization's setup cost.
 
 ### 5b. `train_parallel` — same as train_serial
 
-Literally identical code — `train_parallel` is retained for naming parity
-with the other algorithms, so `analytics_engine.cpp` can time a uniform
+Same setup code as `train_serial` — `train_parallel` is retained for naming
+parity with the other algorithms, so `analytics_engine.cpp` can time a uniform
 "train then predict" block without special-casing KNN. **No OMP or pthreads
 is used at train time** (would be a waste).
 
-Consequence: **KNN's speedup is driven entirely by parallel inference.** The
-serial model and the parallel model contain bit-identical data.
+Consequence: **KNN's speedup is driven almost entirely by parallel inference.**
+The serial model and the parallel model contain bit-identical data and norms.
 
 ### 5c. No third trainer variant
 
@@ -199,37 +233,42 @@ story is moved to inference, where it actually happens.
 
 ## 6. Inference — three variants (this is the hot loop)
 
-All three variants call the same `predict_one(model, xq)` kernel (single-query
-top-k scan). They differ only in how `n_test = 24,483` queries are distributed
-across threads.
+All three variants call the same blocked kernel. They differ only in how
+`ceil(n_test / QUERY_BLOCK)` query blocks are distributed across threads.
 
 ### 6a. `predict_serial`
 
-Trivial `for i in [0, n_test)` loop. Single baseline.
+Computes `‖xq‖²` for the test matrix, then runs `predict_blocked_range` over
+the full test range in one thread. This is the serial baseline.
 
 ### 6b. `predict_parallel_omp`
 
 ```cpp
-#pragma omp parallel for schedule(static) num_threads(N_THREADS)
-for (int i = 0; i < n_test; ++i)
-    pred[i] = predict_one(model, &X_test[i * n_features]);
+#pragma omp parallel num_threads(N_THREADS)
+{
+    #pragma omp for schedule(static)
+    for (int b = 0; b < n_blocks; ++b)
+        predict_query_block(... block b ...);
+}
 ```
 
-Static scheduling is correct because every query does the same amount of work
-(one full sweep of the training set). Each thread holds its own stack-local
-top-k heap — no shared mutable state, no critical section, no atomics.
+Static scheduling is correct because every block does the same training-set
+sweep. Each thread holds its own block-local buffers (`qbuf`, `dist`,
+`best_dist`, `best_label`, `max_idx`, `max_dist`) — no shared mutable state,
+no critical section, no atomics.
 
 ### 6c. `predict_parallel_pthreads`
 
 Fixed pool of `N_THREADS` workers, each takes a static slice
 `[t · n_test / P, (t+1) · n_test / P)` of the test set. Worker just runs the
-same `predict_one` over its slice. `pthread_join` at the end supplies the
+same blocked predictor over its slice. `pthread_join` at the end supplies the
 only barrier — no mutex, no intermediate sync.
 
 ```cpp
 struct KNNPredArg {
     const KNNModel* model;
     const std::vector<float>* X_test;
+    const std::vector<float>* test_norm2;
     Labels* pred;
     int s_off, e_off;
 };
@@ -250,57 +289,64 @@ embarrassingly-parallel workload.
 
 ### Cost model per query
 
-`predict_one` touches:
-- `n_rows × n_features × 4 B = 98K × 103 × 4 ≈ 40 MB` of X_train (reread once
-  per query, streams through L3)
-- `n_rows × 4 B = 400 KB` of y_train (stays in L2)
-- per-candidate k-slot scan: at worst `n_rows` passes, each touching ~88 B of
-  the top-k array (fits in L1)
+For each query block, `predict_query_block` touches:
+- `n_rows × n_features × 4 B = 98K × 103 × 4 ≈ 40 MB` of `X_train`, streamed
+  once and reused across up to 16 test queries.
+- `QUERY_BLOCK × n_features × 4 B ≈ 6.6 KB` of transposed query data in `qbuf`
+  (fits in L1).
+- `n_rows × 4 B = 400 KB` of `y_train`, plus `n_rows × 4 B` of precomputed
+  train norms.
+- per-candidate k-slot scans only when a candidate beats the current worst
+  distance; the k arrays fit in L1.
 
-Per-test-row: ~40 MB streamed + trivial compute. **At T=1 this is bandwidth-
-bound.** At T=8, eight threads split the queries — *each* thread still
-streams ~40 MB of X per query, but they're all reading the same X (shared
-read-only) which the L3 serves once per cache line, not once per thread.
-Net: compute and L3-bandwidth are both used efficiently, hence the 6.26×
-observed speedup.
+Compared with the old query-major loop, the current block-major loop trades a
+little more per-model setup (`norm2`) for much better training-row reuse. The
+local pthread targeted benchmark improved from 24.35 s to 7.83 s on the full
+split. At T=8, the same high-level scaling story still applies: threads split
+query blocks, share read-only training data through L3, and synchronize only at
+the final join/barrier.
 
 ---
 
 ## 7. Arithmetic intensity (for the writeup)
 
-**Per (test-sample, train-sample) pair in the inner distance loop:**
+**Per (test-sample, train-sample) pair in the current dot-product inner loop:**
 
 | Memory op                              | Bytes   |
 |----------------------------------------|--------:|
-| Load `xi[0..F]`  (F=103 floats)        | 412     |
-| Load `xq[0..F]`  (amortized; in L1)    | ≈0      |
-| Load `y[i]`     (1 byte, amortized)    | ≈0      |
+| Load `xi[0..F]`  (F=103 floats, reused across query block) | 412 |
+| Load `qbuf[0..F]` (amortized; in L1)                       | ≈0  |
+| Load norms / label (amortized)                             | ≈0  |
 
-Ops per (test, train) pair: `F` subtracts + `F` multiplies + `F` adds = 3F
-≈ **309 FLOPs** per 412 bytes.
+Ops per (test, train) pair are approximately `F` multiply-adds for `-2·xq·xi`
+plus two scalar norm operations, roughly **2F ≈ 206 FLOPs** per 412 training
+bytes if counted as separate multiply and add operations.
 
-Effective arithmetic intensity: **~0.75 FLOP/byte.** **Memory-bound** in the
-same class as SVM and NB.
+Effective per-pair arithmetic intensity is therefore **~0.5 FLOP/byte** before
+accounting for query-block reuse and L3 sharing. It remains in the same
+low-AI class as SVM and NB, but the blocked formulation substantially improves
+constant factors.
 
-**Why we scaled despite low AI.** The 0.75 FLOP/byte number is the *per-pair*
-intensity. What actually matters is the **DRAM** intensity, because the train
-matrix is read once per query and **shared across threads**. At T=8 with 24K
-queries split 3K each, each thread streams 40 MB from L3 (not DRAM, since the
-second thread's read hits the cache lines loaded by the first). DRAM bandwidth
-divided by L3 bandwidth ≈ 4×, so effective intensity climbs 4× under sharing,
-leaving ~3 FLOP/byte in DRAM terms — comfortably in the compute-bound regime
-at 8 cores.
+**Why we scaled despite low AI.** The per-pair AI number is not the full
+story. What actually matters is the **DRAM** intensity, because the train
+matrix is read repeatedly and **shared across threads**. At T=8 with 24K
+queries split 3K each, each thread streams training rows mostly from L3 (not
+DRAM, since nearby reads hit cache lines loaded by other workers). DRAM
+bandwidth divided by L3 bandwidth is roughly 4×, so effective DRAM-side
+intensity is several times higher than the naive per-pair estimate.
 
 This is why the proposal's "KNN is memory-bound, will plateau early" was
-wrong: it measured the per-pair AI without accounting for inter-thread L3
-sharing. Would likely bite at T=32+ when L3 bandwidth becomes the bottleneck.
+wrong on the original CARC sweep: it measured the per-pair AI without
+accounting for inter-thread L3 sharing and low synchronization frequency.
+Memory bandwidth would likely bite at T=32+ when L3 bandwidth becomes the
+bottleneck.
 
 Comparison across all five algorithms:
 
 | Algorithm | Inner kernel                  | AI (FLOP/byte) | Expected scaling   | Observed T=8 (pth) |
 |-----------|-------------------------------|---------------:|--------------------|-------------------:|
 | SVM       | `dot(w, x)` + margin check    | ~0.5           | Memory-bound       | 6.02×              |
-| KNN       | squared-L2 distance           | ~0.75          | Memory-bound       | **6.26×**          |
+| KNN       | blocked squared-L2 / dot product | ~0.5–0.75   | Memory-bound       | **6.26×**          |
 | NB        | frequency count + Gaussian MLE| ~0.75          | Memory-bound       | 3.56×              |
 | DT        | histogram fill + Gini sweep   | ~3             | Crossover regime   | 1.87×              |
 | MLP       | dense GEMM forward/back       | ~42            | Compute-bound      | 4.62×              |
@@ -316,19 +362,20 @@ total serial time, so *any* per-epoch/per-worker overhead is visible at T=8.
 
 ## 8. Numerical & correctness risks
 
-1. **`double` accumulation of `d²`.** `squared_l2` accumulates into `double`
-   even though `xq`, `xi` are `float` — prevents catastrophic cancellation
-   at 103-term dot products. Changing the accumulator to `float` would break
-   tie-breaking ordering on near-equal distances.
+1. **Float dot-product distance ordering.** The current kernel computes
+   `‖xq‖² + ‖xi‖² − 2·xq·xi` in `float`. This is the right formulation for a
+   BLAS-like implementation, but it can perturb near-tie distances compared
+   with the old direct `double` squared-L2 loop. The observed accuracy remains
+   0.8104 on the full local targeted run, and serial/OMP/pthreads parity is
+   still enforced within each binary run.
 2. **Unstable majority-vote on even k.** `K_NEIGHBORS = 11` is odd, so
    strict majority vote always breaks ties. If a future run uses even k, the
    current code falls back to the nearest-neighbor's label on `pos == neg`
    — still deterministic. Documented.
-3. **Non-determinism from parallel inference.** Each query is independent,
-   so OMP and pthreads produce byte-identical predictions to serial — the
-   top-k heap fills deterministically given a fixed scan order (single pass
-   over `i = 0..n_rows`). Parity check prints `|acc_serial − acc_par| =
-   0.0000` in all runs.
+3. **Non-determinism from parallel inference.** Each query block is independent,
+   so OMP and pthreads produce the same predictions as serial for a fixed
+   kernel and scan order. Parity check prints `|acc_serial − acc_par| =
+   0.0000` in smoke tests.
 4. **No training-set sharing between variants.** `serial_model`,
    `omp_model`, `pth_model` each copy the full 40 MB `X_train`. Cheap
    compared to inference runtime, but a memory-pressure issue if a future
@@ -341,7 +388,7 @@ total serial time, so *any* per-epoch/per-worker overhead is visible at T=8.
    computation — protected by the `std::atoi` floor of 1.
 6. **Speedup numerator is inference-only.** The sweep CSV uses
    `total_ms = train_ms + infer_ms` to compare against the other
-   algorithms; train_ms is ~13 ms and infer_ms is ~323 s, so this is
+   algorithms; train_ms is still tiny compared with inference, so this is
    essentially inference speedup. Noted in the paper.
 
 ---
@@ -388,8 +435,8 @@ across the five algorithms.
   CS:GO). Target range 0.78–0.82.
 - **Parity**: `|acc_serial − acc_omp| = 0.0000` and
   `|acc_serial − acc_pth|  = 0.0000` — KNN is deterministic at every
-  scheduling order because each query independently fills a fixed-order
-  top-k heap.
+  scheduling order because each query block scans training rows in a fixed
+  order and writes a disjoint output slice.
 - **Speedup**: inference-only. Target 5–7× at 8 cores.
 
 ---
@@ -402,6 +449,14 @@ Append one row per CARC run.
 |------------|---------|:-:|---------------|-----------:|--------:|--------:|:----------:|:-------:|:-------:|:-----------:|:-----------:|-------|
 | 2026-04-20 | 526bb18 | 11 | CARC d17-03 / 8 | 323.02 | 50.52 | 51.55 | 0.8104 | 0.8104 | 0.8104 | 6.39× | 6.26× | Full `{1,2,4,8}` sweep, job 3272373. **Highest speedup of the five** — proposal's "memory-bound, plateaus early" hypothesis was wrong at T=8. Accuracy is the highest of the five. vs sklearn brute (T=8) **ours is 16× slower** because sklearn reformulates the distance matrix as a GEMM (`X_test @ X_train.T`) through OpenBLAS; at T=1 sklearn already beats us 16.4×. Scaling is identical on both sides (~6.2× per thread octave). See [results/results.md §"Key insight"](../results/results.md). |
 
+### Local optimization checks (not CARC-comparable)
+
+| date | implementation | machine | pthreads infer (s) | accuracy | notes |
+|------|----------------|---------|-------------------:|:--------:|-------|
+| 2026-04-21 | old direct loop | Eric's MacBook Pro / 8 pthreads | 24.35 | 0.8104 | Targeted harness calling only `predict_parallel_pthreads`; Apple Clang/Xcode SDK build. |
+| 2026-04-21 | blocked dot-product loop | Eric's MacBook Pro / 8 pthreads | 7.83 | 0.8104 | Current repo implementation; ~3.1× faster than old direct loop locally, still behind local sklearn brute (~1.64 s). |
+| 2026-04-21 | temporary Accelerate BLAS prototype | Eric's MacBook Pro | 1.78 | 0.8102 | Not committed; shows vendor BLAS closes almost all of the sklearn gap. |
+
 ---
 
 ## 11. Followups (known work deferred)
@@ -413,11 +468,11 @@ Append one row per CARC run.
   has 96–128. Running T ∈ {16, 32, 64} would confirm whether memory
   bandwidth bites at 16 or 32 threads (predicted: 15–25× at T=64, not
   linear 50×). Publish the full Amdahl/Gustafson curve.
-- **GEMM-based KNN** — close the 16× gap vs sklearn by implementing a
-  cache-tiled `X_test @ X_train.T` by hand. Explicitly *against the spirit*
-  of the no-external-libraries rule, but the data point would strengthen
-  the "algorithmic reformulation dominates parallelization" argument.
-  Deferred unless the paper needs a counterfactual.
+- **Vendor-BLAS KNN** — the temporary Accelerate prototype is already close to
+  sklearn locally. A portable version could use OpenBLAS/MKL on CARC and would
+  likely close or reverse the KNN row, but it changes the claim from
+  "from-scratch C++17" to "C++ orchestration plus a vendor GEMM kernel."
+  Deferred unless the paper explicitly wants that counterfactual.
 - **Partial sort / approximate KNN** — for k=11 out of n_rows=98K, a
   priority-queue-based selection (Dutch-national-flag / introselect) would
   shave the per-query constant but doesn't change complexity.

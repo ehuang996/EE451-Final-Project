@@ -3,7 +3,8 @@
 // Dataset : train_cleaned.csv / test_cleaned.csv
 // Label   : round_winner in {+1, -1}
 // Parallel: predict_parallel_omp (OpenMP) + predict_parallel_pthreads (pool)
-//          (KNN's training is trivial — all parallelism is in inference.)
+//          (training stores data + row norms; parallelism is in inference.)
+// Kernel  : cache-blocked exact brute force using ||a-b||^2 = ||a||^2 + ||b||^2 - 2ab.
 // =============================================================================
 // g++ -std=c++17 -O3 -march=native -fopenmp knn.cpp -o knn -lpthread
 // ./knn train_cleaned.csv test_cleaned.csv [k]
@@ -49,11 +50,14 @@ struct Metrics {
 
 struct KNNModel {
     std::vector<float> X;
+    std::vector<float> norm2;
     Labels y;
     int n_rows = 0;
     int n_features = 0;
     int k = K_NEIGHBORS;
 };
+
+static constexpr int QUERY_BLOCK = 16;
 
 static double now_ms() {
     using clock = std::chrono::high_resolution_clock;
@@ -267,97 +271,182 @@ static Dataset load_dataset(const std::string& train_path_in,
     return ds;
 }
 
-static KNNModel train_serial(const std::vector<float>& X,
-                             const Labels& y,
-                             int n_features,
-                             int k) {
+static std::vector<float> row_norms(const std::vector<float>& X, int n_rows, int n_features) {
+    std::vector<float> out(n_rows, 0.0f);
+    for (int i = 0; i < n_rows; ++i) {
+        const float* row = &X[static_cast<size_t>(i) * n_features];
+        float sum = 0.0f;
+        for (int j = 0; j < n_features; ++j) sum += row[j] * row[j];
+        out[i] = sum;
+    }
+    return out;
+}
+
+static KNNModel make_model(const std::vector<float>& X,
+                           const Labels& y,
+                           int n_features,
+                           int k) {
     KNNModel m;
     m.X = X;
+    m.norm2 = row_norms(m.X, static_cast<int>(y.size()), n_features);
     m.y = y;
     m.n_rows = static_cast<int>(y.size());
     m.n_features = n_features;
     m.k = std::min(std::max(k, 1), m.n_rows);
     return m;
+}
+
+static KNNModel train_serial(const std::vector<float>& X,
+                             const Labels& y,
+                             int n_features,
+                             int k) {
+    return make_model(X, y, n_features, k);
 }
 
 static KNNModel train_parallel(const std::vector<float>& X,
                                const Labels& y,
                                int n_features,
                                int k) {
-    KNNModel m;
-    m.X = X;
-    m.y = y;
-    m.n_rows = static_cast<int>(y.size());
-    m.n_features = n_features;
-    m.k = std::min(std::max(k, 1), m.n_rows);
-    return m;
+    return make_model(X, y, n_features, k);
 }
 
-static inline double squared_l2(const float* a, const float* b, int n_features) {
-    double sum = 0.0;
-    for (int j = 0; j < n_features; ++j) {
-        const double d = static_cast<double>(a[j]) - b[j];
-        sum += d * d;
+static void finalize_block_predictions(const int q_count,
+                                       const int k,
+                                       const std::vector<float>& best_dist,
+                                       const std::vector<int>& best_label,
+                                       Labels& pred,
+                                       const int q_begin) {
+    for (int q = 0; q < q_count; ++q) {
+        const int off = q * k;
+        int pos = 0;
+        int neg = 0;
+        int nearest_label = 1;
+        float nearest_dist = std::numeric_limits<float>::infinity();
+
+        for (int t = 0; t < k; ++t) {
+            const int label = best_label[off + t];
+            if (label == 1)
+                ++pos;
+            else
+                ++neg;
+
+            const float d = best_dist[off + t];
+            if (d < nearest_dist) {
+                nearest_dist = d;
+                nearest_label = label;
+            }
+        }
+
+        if (pos > neg)
+            pred[q_begin + q] = 1;
+        else if (neg > pos)
+            pred[q_begin + q] = -1;
+        else
+            pred[q_begin + q] = nearest_label;
     }
-    return sum;
 }
 
-static int predict_one(const KNNModel& model, const float* xq) {
+static void predict_query_block(const KNNModel& model,
+                                const std::vector<float>& X_test,
+                                const std::vector<float>& test_norm2,
+                                Labels& pred,
+                                int q_begin,
+                                int q_end,
+                                std::vector<float>& qbuf,
+                                std::vector<float>& best_dist,
+                                std::vector<int>& best_label,
+                                std::vector<int>& max_idx,
+                                std::vector<float>& max_dist,
+                                std::vector<float>& dist) {
+    const int q_count = q_end - q_begin;
+    const int n_features = model.n_features;
     const int k = model.k;
-    std::vector<double> best_dist(k, std::numeric_limits<double>::infinity());
-    std::vector<int> best_label(k, 0);
 
-    int max_idx = 0;
-    double max_dist = best_dist[0];
-    const auto& X = model.X;
-    const auto& y = model.y;
+    for (int j = 0; j < n_features; ++j) {
+        float* qcol = &qbuf[static_cast<size_t>(j) * QUERY_BLOCK];
+        for (int q = 0; q < q_count; ++q) {
+            qcol[q] = X_test[static_cast<size_t>(q_begin + q) * n_features + j];
+        }
+    }
+
+    const int slots = q_count * k;
+    std::fill(best_dist.begin(), best_dist.begin() + slots,
+              std::numeric_limits<float>::infinity());
+    std::fill(best_label.begin(), best_label.begin() + slots, 0);
+    std::fill(max_idx.begin(), max_idx.begin() + q_count, 0);
+    std::fill(max_dist.begin(), max_dist.begin() + q_count,
+              std::numeric_limits<float>::infinity());
 
     for (int i = 0; i < model.n_rows; ++i) {
-        const float* xi = &X[static_cast<size_t>(i) * model.n_features];
-        const double d2 = squared_l2(xq, xi, model.n_features);
+        const float train_norm = model.norm2[i];
+        for (int q = 0; q < q_count; ++q) {
+            dist[q] = train_norm + test_norm2[q_begin + q];
+        }
 
-        if (d2 < max_dist) {
-            best_dist[max_idx] = d2;
-            best_label[max_idx] = y[i];
+        const float* xi = &model.X[static_cast<size_t>(i) * n_features];
+        for (int j = 0; j < n_features; ++j) {
+            const float scale = -2.0f * xi[j];
+            const float* qcol = &qbuf[static_cast<size_t>(j) * QUERY_BLOCK];
+#ifdef _OPENMP
+#pragma omp simd
+#endif
+            for (int q = 0; q < q_count; ++q) {
+                dist[q] += scale * qcol[q];
+            }
+        }
 
-            max_idx = 0;
-            max_dist = best_dist[0];
-            for (int t = 1; t < k; ++t) {
-                if (best_dist[t] > max_dist) {
-                    max_dist = best_dist[t];
-                    max_idx = t;
+        const int label = model.y[i];
+        for (int q = 0; q < q_count; ++q) {
+            const float d = dist[q];
+            if (d < max_dist[q]) {
+                const int off = q * k;
+                const int replace = max_idx[q];
+                best_dist[off + replace] = d;
+                best_label[off + replace] = label;
+
+                int next_idx = 0;
+                float next_dist = best_dist[off];
+                for (int t = 1; t < k; ++t) {
+                    const float candidate = best_dist[off + t];
+                    if (candidate > next_dist) {
+                        next_dist = candidate;
+                        next_idx = t;
+                    }
                 }
+                max_idx[q] = next_idx;
+                max_dist[q] = next_dist;
             }
         }
     }
 
-    int pos = 0;
-    int neg = 0;
-    int nearest_label = 1;
-    double nearest_dist = std::numeric_limits<double>::infinity();
-    for (int i = 0; i < k; ++i) {
-        if (best_label[i] == 1)
-            ++pos;
-        else
-            ++neg;
+    finalize_block_predictions(q_count, k, best_dist, best_label, pred, q_begin);
+}
 
-        if (best_dist[i] < nearest_dist) {
-            nearest_dist = best_dist[i];
-            nearest_label = best_label[i];
-        }
+static void predict_blocked_range(const KNNModel& model,
+                                  const std::vector<float>& X_test,
+                                  const std::vector<float>& test_norm2,
+                                  Labels& pred,
+                                  int q_begin,
+                                  int q_end) {
+    const int k = model.k;
+    std::vector<float> qbuf(static_cast<size_t>(model.n_features) * QUERY_BLOCK);
+    std::vector<float> best_dist(static_cast<size_t>(QUERY_BLOCK) * k);
+    std::vector<int> best_label(static_cast<size_t>(QUERY_BLOCK) * k);
+    std::vector<int> max_idx(QUERY_BLOCK);
+    std::vector<float> max_dist(QUERY_BLOCK);
+    std::vector<float> dist(QUERY_BLOCK);
+
+    for (int q0 = q_begin; q0 < q_end; q0 += QUERY_BLOCK) {
+        const int q1 = std::min(q0 + QUERY_BLOCK, q_end);
+        predict_query_block(model, X_test, test_norm2, pred, q0, q1,
+                            qbuf, best_dist, best_label, max_idx, max_dist, dist);
     }
-
-    if (pos > neg) return 1;
-    if (neg > pos) return -1;
-    return nearest_label;
 }
 
 static Labels predict_serial(const KNNModel& model, const std::vector<float>& X_test, int n_test) {
     Labels pred(n_test);
-    for (int i = 0; i < n_test; ++i) {
-        const float* xq = &X_test[static_cast<size_t>(i) * model.n_features];
-        pred[i] = predict_one(model, xq);
-    }
+    const std::vector<float> test_norm2 = row_norms(X_test, n_test, model.n_features);
+    predict_blocked_range(model, X_test, test_norm2, pred, 0, n_test);
     return pred;
 }
 
@@ -365,13 +454,30 @@ static Labels predict_parallel_omp(const KNNModel& model,
                                    const std::vector<float>& X_test,
                                    int n_test) {
     Labels pred(n_test);
+    const std::vector<float> test_norm2 = row_norms(X_test, n_test, model.n_features);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(N_THREADS)
-#endif
-    for (int i = 0; i < n_test; ++i) {
-        const float* xq = &X_test[static_cast<size_t>(i) * model.n_features];
-        pred[i] = predict_one(model, xq);
+    const int n_blocks = (n_test + QUERY_BLOCK - 1) / QUERY_BLOCK;
+#pragma omp parallel num_threads(N_THREADS)
+    {
+        const int k = model.k;
+        std::vector<float> qbuf(static_cast<size_t>(model.n_features) * QUERY_BLOCK);
+        std::vector<float> best_dist(static_cast<size_t>(QUERY_BLOCK) * k);
+        std::vector<int> best_label(static_cast<size_t>(QUERY_BLOCK) * k);
+        std::vector<int> max_idx(QUERY_BLOCK);
+        std::vector<float> max_dist(QUERY_BLOCK);
+        std::vector<float> dist(QUERY_BLOCK);
+
+#pragma omp for schedule(static)
+        for (int b = 0; b < n_blocks; ++b) {
+            const int q0 = b * QUERY_BLOCK;
+            const int q1 = std::min(q0 + QUERY_BLOCK, n_test);
+            predict_query_block(model, X_test, test_norm2, pred, q0, q1,
+                                qbuf, best_dist, best_label, max_idx, max_dist, dist);
+        }
     }
+#else
+    predict_blocked_range(model, X_test, test_norm2, pred, 0, n_test);
+#endif
     return pred;
 }
 
@@ -386,6 +492,7 @@ static Labels predict_parallel_omp(const KNNModel& model,
 struct KNNPredArg {
     const KNNModel*           model;
     const std::vector<float>* X_test;
+    const std::vector<float>* test_norm2;
     Labels*                   pred;
     int                       s_off;  // inclusive start of this worker's slice
     int                       e_off;  // exclusive end
@@ -393,11 +500,8 @@ struct KNNPredArg {
 
 static void* knn_pthread_worker(void* raw) {
     auto* a = static_cast<KNNPredArg*>(raw);
-    const int n_features = a->model->n_features;
-    for (int i = a->s_off; i < a->e_off; ++i) {
-        const float* xq = &(*a->X_test)[static_cast<size_t>(i) * n_features];
-        (*a->pred)[i] = predict_one(*a->model, xq);
-    }
+    predict_blocked_range(*a->model, *a->X_test, *a->test_norm2, *a->pred,
+                          a->s_off, a->e_off);
     return nullptr;
 }
 
@@ -408,14 +512,16 @@ static Labels predict_parallel_pthreads(const KNNModel& model,
     if (n_test == 0) return pred;
 
     const int slice = n_test / N_THREADS;
+    const std::vector<float> test_norm2 = row_norms(X_test, n_test, model.n_features);
     std::vector<KNNPredArg>  args(N_THREADS);
     std::vector<pthread_t>   threads(N_THREADS);
     for (int t = 0; t < N_THREADS; ++t) {
-        args[t].model  = &model;
-        args[t].X_test = &X_test;
-        args[t].pred   = &pred;
-        args[t].s_off  = t * slice;
-        args[t].e_off  = (t == N_THREADS - 1) ? n_test : (t + 1) * slice;
+        args[t].model      = &model;
+        args[t].X_test     = &X_test;
+        args[t].test_norm2 = &test_norm2;
+        args[t].pred       = &pred;
+        args[t].s_off      = t * slice;
+        args[t].e_off      = (t == N_THREADS - 1) ? n_test : (t + 1) * slice;
         pthread_create(&threads[t], nullptr, knn_pthread_worker, &args[t]);
     }
     for (int t = 0; t < N_THREADS; ++t) pthread_join(threads[t], nullptr);
