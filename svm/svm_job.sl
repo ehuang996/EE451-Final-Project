@@ -9,4 +9,4 @@
 g++ -std=c++17 -O3 -march=native -fopenmp svm.cpp -o svm -lpthread
 
 # Run
-./svm train_cleaned.csv test_cleaned.csv
+./svm ../train_cleaned.csv ../test_cleaned.csv

@@ -1,511 +1,440 @@
 // =============================================================================
-// svm.cpp — Serial and Parallel Linear SVM (hinge loss + L2 regularisation)
-// Dataset  : train_cleaned.csv / test_cleaned.csv
-//            (103 features, label: round_winner in {+1, -1})
-// Language : C++17
+// svm.cpp - Serial and Parallel Linear SVM (hinge loss + L2 regularization)
+// Dataset : train_cleaned.csv / test_cleaned.csv
+// Label   : round_winner in {+1, -1}
 // =============================================================================
+// g++ -std=c++17 -O3 -march=native -fopenmp svm.cpp -o svm
+// ./svm train_cleaned.csv test_cleaned.csv [epochs] [lr] [lambda]
 
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <vector>
-#include <string>
 #include <algorithm>
-#include <numeric>
-#include <cmath>
 #include <chrono>
-#include <random>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
-#include <cassert>
-#include <pthread.h>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Hyperparameters
-// ─────────────────────────────────────────────────────────────────────────────
-static constexpr int    N_FEATURES  = 103;     // number of features in the dataset
-static constexpr double LAMBDA      = 1e-4;   // L2 regularisation strength
-static constexpr int    MAX_EPOCHS  = 200;     // full-pass epochs over training set
-static constexpr double LR          = 0.01;   // learning rate (fixed)
-static constexpr int    N_THREADS   = 8;      // worker threads for parallel SVM
-static constexpr int    SEED        = 42;     // RNG seed for reproducibility
+static constexpr int N_THREADS = 8;
+static constexpr int MAX_EPOCHS = 20;
+static constexpr double LR = 0.02;
+static constexpr double LAMBDA = 1e-4;
 
-using Vec    = std::vector<double>;
-using Matrix = std::vector<Vec>;
-using IVec   = std::vector<int>;
+using Labels = std::vector<int>;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper Functions
-// ─────────────────────────────────────────────────────────────────────────────
-static inline double dot(const Vec& a, const Vec& b) noexcept {
+struct Dataset {
+    int n_features = 0;
+    std::vector<float> X_train;  // row-major: n_train x n_features
+    std::vector<float> X_test;   // row-major: n_test x n_features
+    Labels y_train;
+    Labels y_test;
+};
+
+struct Metrics {
+    double acc = 0.0;
+    double prec = 0.0;
+    double rec = 0.0;
+    double f1 = 0.0;
+};
+
+struct SVMModel {
+    std::vector<double> w;
+    double b = 0.0;
+};
+
+static double now_ms() {
+    using clock = std::chrono::high_resolution_clock;
+    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
+}
+
+static std::vector<std::string> split_csv(const std::string& line) {
+    std::vector<std::string> out;
+    std::stringstream ss(line);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) out.push_back(tok);
+    return out;
+}
+
+static std::string resolve_path(const std::string& path) {
+    if (std::filesystem::exists(path)) return path;
+    const std::string alt = "../" + path;
+    if (std::filesystem::exists(alt)) return alt;
+    return path;
+}
+
+static int parse_int_or_default(const char* raw, int fallback, const char* name) {
+    try {
+        return std::stoi(raw);
+    } catch (...) {
+        std::cerr << "Warning: invalid " << name << "='" << raw << "', using " << fallback << ".\n";
+        return fallback;
+    }
+}
+
+static double parse_double_or_default(const char* raw, double fallback, const char* name) {
+    try {
+        return std::stod(raw);
+    } catch (...) {
+        std::cerr << "Warning: invalid " << name << "='" << raw << "', using " << fallback << ".\n";
+        return fallback;
+    }
+}
+
+static void load_csv_rows(const std::string& path,
+                          int label_col,
+                          int n_features,
+                          std::vector<float>& X,
+                          Labels& y) {
+    std::ifstream file(path);
+    if (!file) {
+        std::cerr << "Error: cannot open file: " << path << "\n";
+        std::exit(1);
+    }
+
+    std::string line;
+    std::getline(file, line);  // skip header
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string tok;
+        int col = 0;
+        int feat_count = 0;
+        int label = 0;
+
+        while (std::getline(ss, tok, ',')) {
+            if (col == label_col) {
+                label = std::stoi(tok);
+            } else {
+                X.push_back(static_cast<float>(std::stod(tok)));
+                ++feat_count;
+            }
+            ++col;
+        }
+
+        if (feat_count != n_features) {
+            std::cerr << "Error: row has " << feat_count
+                      << " features, expected " << n_features << "\n";
+            std::exit(1);
+        }
+        y.push_back(label);
+    }
+}
+
+static Dataset load_dataset(const std::string& train_path_in,
+                            const std::string& test_path_in) {
+    Dataset ds;
+    const std::string train_path = resolve_path(train_path_in);
+    const std::string test_path = resolve_path(test_path_in);
+
+    std::ifstream train_file(train_path);
+    if (!train_file) {
+        std::cerr << "Error: cannot open training file: " << train_path << "\n";
+        std::exit(1);
+    }
+
+    std::string train_header;
+    if (!std::getline(train_file, train_header)) {
+        std::cerr << "Error: training file is empty: " << train_path << "\n";
+        std::exit(1);
+    }
+
+    auto cols = split_csv(train_header);
+    int label_col = -1;
+    for (int i = 0; i < static_cast<int>(cols.size()); ++i) {
+        if (cols[i] == "round_winner") {
+            label_col = i;
+            break;
+        }
+    }
+    if (label_col < 0) {
+        std::cerr << "Error: column 'round_winner' not found in training header.\n";
+        std::exit(1);
+    }
+
+    ds.n_features = static_cast<int>(cols.size()) - 1;
+    train_file.close();
+
+    load_csv_rows(train_path, label_col, ds.n_features, ds.X_train, ds.y_train);
+    load_csv_rows(test_path, label_col, ds.n_features, ds.X_test, ds.y_test);
+
+    const int n_train = static_cast<int>(ds.y_train.size());
+    const int n_test = static_cast<int>(ds.y_test.size());
+
+    std::vector<double> mean(ds.n_features, 0.0);
+    std::vector<double> sd(ds.n_features, 0.0);
+
+    for (int i = 0; i < n_train; ++i) {
+        const float* row = &ds.X_train[static_cast<size_t>(i) * ds.n_features];
+        for (int j = 0; j < ds.n_features; ++j) mean[j] += row[j];
+    }
+    for (int j = 0; j < ds.n_features; ++j) mean[j] /= n_train;
+
+    for (int i = 0; i < n_train; ++i) {
+        const float* row = &ds.X_train[static_cast<size_t>(i) * ds.n_features];
+        for (int j = 0; j < ds.n_features; ++j) {
+            const double d = static_cast<double>(row[j]) - mean[j];
+            sd[j] += d * d;
+        }
+    }
+    for (int j = 0; j < ds.n_features; ++j) {
+        sd[j] = std::sqrt(sd[j] / n_train);
+        if (sd[j] < 1e-9) sd[j] = 1.0;
+    }
+
+    auto normalize_inplace = [&](std::vector<float>& X, int n_rows) {
+        for (int i = 0; i < n_rows; ++i) {
+            float* row = &X[static_cast<size_t>(i) * ds.n_features];
+            for (int j = 0; j < ds.n_features; ++j) {
+                row[j] = static_cast<float>((row[j] - mean[j]) / sd[j]);
+            }
+        }
+    };
+    normalize_inplace(ds.X_train, n_train);
+    normalize_inplace(ds.X_test, n_test);
+
+    int tr_pos = 0, tr_neg = 0, te_pos = 0, te_neg = 0;
+    for (int l : ds.y_train) (l == 1 ? tr_pos : tr_neg)++;
+    for (int l : ds.y_test) (l == 1 ? te_pos : te_neg)++;
+
+    std::cout << "Dataset Info\n";
+    std::cout << "  X_train: " << n_train << " x " << ds.n_features << "\n";
+    std::cout << "  X_test : " << n_test << " x " << ds.n_features << "\n";
+    std::cout << "  y_train: +1=" << tr_pos << "  -1=" << tr_neg << "\n";
+    std::cout << "  y_test : +1=" << te_pos << "  -1=" << te_neg << "\n\n";
+
+    return ds;
+}
+
+static inline double dot_row(const std::vector<double>& w, const float* x, int n_features) {
     double s = 0.0;
-    for (int j = 0; j < N_FEATURES; ++j) {
-        s += a[j] * b[j];
+    for (int j = 0; j < n_features; ++j) {
+        s += w[j] * static_cast<double>(x[j]);
     }
     return s;
 }
 
-static double now_ms() {
-    using clock = std::chrono::high_resolution_clock;
-    return std::chrono::duration<double, std::milli>(
-               clock::now().time_since_epoch()).count();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Dataset Loading and Preprocessing
-// ─────────────────────────────────────────────────────────────────────────────
-struct Dataset {
-    Matrix X_train, X_test;
-    IVec   y_train, y_test; // labels in {+1, -1}
-};
-
-Dataset load_dataset(const std::string& train_path, const std::string& test_path) {
-    auto parse_row = [&](const std::string& line, bool /*build_map*/)
-                     -> std::pair<Vec, int> {
-        Vec row;
-        row.reserve(N_FEATURES);
-        std::istringstream ss(line);
-        std::string tok;
-        int col = 0, label = 0;
-        while (std::getline(ss, tok, ',')) {
-            if (col == 95) {
-                // round_winner column: already +1 or -1
-                label = std::stoi(tok);
-            } else {
-                row.push_back(std::stod(tok));
-            }
-            ++col;
-        }
-        return {std::move(row), label};
-    };
-
-    auto load_file = [&](const std::string& path, bool build_map,
-                         Matrix& X, IVec& y) {
-        std::ifstream file(path);
-        if (!file) {
-            std::cerr << "Error: cannot open file: " << path << "\n";
-            std::exit(1);
-        }
-        std::string line;
-        std::getline(file, line); // skip header
-        while (std::getline(file, line)) {
-            if (line.empty()) continue;
-            auto [row, lbl] = parse_row(line, build_map);
-            X.push_back(std::move(row));
-            y.push_back(lbl);
-        }
-    };
-
-    Dataset ds;
-    load_file(train_path, /*build_map=*/true,  ds.X_train, ds.y_train);
-    load_file(test_path,  /*build_map=*/false, ds.X_test,  ds.y_test);
-
-    int n_train = static_cast<int>(ds.X_train.size());
-    int n_test  = static_cast<int>(ds.X_test.size());
-
-    // Compute mean and std-dev on training set only for every feature
-    Vec mean(N_FEATURES, 0.0);
-    Vec sd(N_FEATURES, 0.0);
-
-    for (int i = 0; i < n_train; ++i)
-        for (int j = 0; j < N_FEATURES; ++j)
-            mean[j] += ds.X_train[i][j];
-    for (int j = 0; j < N_FEATURES; ++j)
-        mean[j] /= n_train;
-
-    for (int i = 0; i < n_train; ++i)
-        for (int j = 0; j < N_FEATURES; ++j) {
-            double d = ds.X_train[i][j] - mean[j];
-            sd[j] += d * d;
-        }
-    for (int j = 0; j < N_FEATURES; ++j) {
-        sd[j] = std::sqrt(sd[j] / n_train);
-        if (sd[j] < 1e-9) sd[j] = 1.0;   // guard constant features
-    }
-
-    // Normalise both splits in-place
-    auto norm_inplace = [&](Matrix& X) {
-        for (auto& row : X)
-            for (int j = 0; j < N_FEATURES; ++j)
-                row[j] = (row[j] - mean[j]) / sd[j];
-    };
-    norm_inplace(ds.X_train);
-    norm_inplace(ds.X_test);
-
-    // Count class distribution
-    int tr_pos = 0, tr_neg = 0, te_pos = 0, te_neg = 0;
-    for (int l : ds.y_train) (l == 1 ? tr_pos : tr_neg)++;
-    for (int l : ds.y_test)  (l == 1 ? te_pos : te_neg)++;
-
-    std::cout << "┌─────────────────────────────────────────────────┐\n";
-    std::cout << "│  Dataset Info                                   │\n";
-    std::cout << "├─────────────────────────────────────────────────┤\n";
-    std::cout << "│  X_train : " << n_train << " x " << N_FEATURES
-              << std::string(37 - std::to_string(n_train).size()
-                                - std::to_string(N_FEATURES).size(), ' ') << "\n";
-    std::cout << "│  X_test  : " << n_test  << " x " << N_FEATURES
-              << std::string(37 - std::to_string(n_test).size()
-                                - std::to_string(N_FEATURES).size(), ' ') << "\n";
-    std::cout << "│  y_train : +1=" << tr_pos << "  -1=" << tr_neg << "\n";
-    std::cout << "│  y_test  : +1=" << te_pos << "  -1=" << te_neg << "\n";
-    std::cout << "└─────────────────────────────────────────────────┘\n\n";
-    return ds;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Model Structure Declaration
-// ─────────────────────────────────────────────────────────────────────────────
-
-struct SVMModel {
-    Vec    w = Vec(N_FEATURES, 0.0);
-    double b = 0.0;
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Inference
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Serial prediction
-IVec predict_serial(const SVMModel& m, const Matrix& X) {
-    IVec out;
-    out.reserve(X.size());
-    for (const auto& x : X)
-        out.push_back((dot(m.w, x) + m.b) >= 0.0 ? 1 : -1);
-    return out;
-}
-
-// OpenMP-parallelised prediction
-IVec predict_parallel(const SVMModel& m, const Matrix& X) {
-    int n = static_cast<int>(X.size());
-    IVec out(n);
-    #ifdef _OPENMP
-        #pragma omp parallel for schedule(static) num_threads(N_THREADS)
-    #endif
-    for (int i = 0; i < n; ++i)
-        out[i] = (dot(m.w, X[i]) + m.b) >= 0.0 ? 1 : -1;
-    return out;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Evaluation Metrics
-// ─────────────────────────────────────────────────────────────────────────────
-struct Metrics { double acc, prec, rec, f1; };
-
-Metrics evaluate(const IVec& truth, const IVec& pred) {
-    int TP = 0, FP = 0, TN = 0, FN = 0;
-    for (int i = 0; i < static_cast<int>(truth.size()); ++i) {
-        if      (truth[i] ==  1 && pred[i] ==  1) ++TP;
-        else if (truth[i] == -1 && pred[i] ==  1) ++FP;
-        else if (truth[i] == -1 && pred[i] == -1) ++TN;
-        else                                       ++FN;
-    }
-    double acc  = static_cast<double>(TP + TN) / static_cast<double>(truth.size());
-    double prec = (TP + FP) > 0 ? static_cast<double>(TP) / (TP + FP) : 0.0;
-    double rec  = (TP + FN) > 0 ? static_cast<double>(TP) / (TP + FN) : 0.0;
-    double f1   = (prec + rec) > 0.0 ? 2.0 * prec * rec / (prec + rec) : 0.0;
-    return {acc, prec, rec, f1};
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Serial SVM Training
-// ─────────────────────────────────────────────────────────────────────────────
-
-SVMModel train_serial(const Matrix& X, const IVec& y) {
-    int n = static_cast<int>(X.size());
+static SVMModel train_serial(const std::vector<float>& X,
+                             const Labels& y,
+                             int n_rows,
+                             int n_features,
+                             int epochs,
+                             double lr,
+                             double lambda) {
     SVMModel model;
+    model.w.assign(n_features, 0.0);
+    model.b = 0.0;
+    if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
 
-    for (int epoch = 0; epoch < MAX_EPOCHS; ++epoch) {
-        Vec    gw(N_FEATURES, 0.0);
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+        std::vector<double> gw(n_features, 0.0);
         double gb = 0.0;
 
-        for (int i = 0; i < n; ++i) {
-            if (y[i] * (dot(model.w, X[i]) + model.b) < 1.0) {
-                for (int j = 0; j < N_FEATURES; ++j)
-                    gw[j] += static_cast<double>(y[i]) * X[i][j];
-                gb += static_cast<double>(y[i]);
-            }
-        }
-
-        const double scale = 1.0 - LR * LAMBDA;
-        const double step  = LR / n;
-        for (int j = 0; j < N_FEATURES; ++j)
-            model.w[j] = scale * model.w[j] + step * gw[j];
-        model.b += step * gb;
-    }
-    return model;
-}
-
-// Improvements over train_serial:
-//   1. Decaying learning rate
-//   2. n == 0 guard  — avoids divide-by-zero in step = lr_t / n.
-SVMModel train_better_serial(const Matrix& X, const IVec& y) {
-    int n = static_cast<int>(X.size());
-    assert(n > 0 && "train_better_serial: empty training set");
-    SVMModel model;
-
-    for (int epoch = 0; epoch < MAX_EPOCHS; ++epoch) {
-        // Decaying learning rate: η_t = LR / sqrt(t + 1)
-        const double lr_t = LR / std::sqrt(static_cast<double>(epoch + 1));
-
-        Vec    gw(N_FEATURES, 0.0);
-        double gb   = 0.0;
-        double loss = 0.0;
-
-        for (int i = 0; i < n; ++i) {
-            double margin = y[i] * (dot(model.w, X[i]) + model.b);
+        for (int i = 0; i < n_rows; ++i) {
+            const float* xi = &X[static_cast<size_t>(i) * n_features];
+            const double margin = static_cast<double>(y[i]) * (dot_row(model.w, xi, n_features) + model.b);
             if (margin < 1.0) {
-                loss += 1.0 - margin;
-                for (int j = 0; j < N_FEATURES; ++j)
-                    gw[j] += static_cast<double>(y[i]) * X[i][j];
-                gb += static_cast<double>(y[i]);
+                const double yi = static_cast<double>(y[i]);
+                for (int j = 0; j < n_features; ++j) gw[j] += yi * static_cast<double>(xi[j]);
+                gb += yi;
             }
         }
-        loss = (LAMBDA / 2.0) * dot(model.w, model.w) + loss / n;
-        std::cout << "epoch " << epoch << "  loss=" << loss << "\n";
 
-        const double scale = 1.0 - lr_t * LAMBDA;
-        const double step  = lr_t / n;
-        for (int j = 0; j < N_FEATURES; ++j) {
+        const double scale = 1.0 - lr * lambda;
+        const double step = lr / static_cast<double>(n_rows);
+        for (int j = 0; j < n_features; ++j) {
             model.w[j] = scale * model.w[j] + step * gw[j];
         }
         model.b += step * gb;
     }
+
     return model;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Parallel SVM Training  (pthreads + mutex for shared gradient accumulation)
-// ─────────────────────────────────────────────────────────────────────────────
-// Strategy:
-//   • Training data is partitioned evenly across N_THREADS pthreads.
-//   • Each epoch:
-//       1. Every thread independently computes its local gradient contribution
-//          over its data partition (no communication needed here).
-//       2. Each thread acquires a mutex and adds its local gradient to the
-//          shared accumulator — fine-grained locking per the proposal.
-//       3. A barrier synchronises all threads after accumulation.
-//       4. Thread 0 applies the weight update and resets the accumulator.
-//       5. A second barrier ensures no thread starts the next epoch before
-//          the model is updated.
+static SVMModel train_parallel(const std::vector<float>& X,
+                               const Labels& y,
+                               int n_rows,
+                               int n_features,
+                               int epochs,
+                               double lr,
+                               double lambda) {
+    SVMModel model;
+    model.w.assign(n_features, 0.0);
+    model.b = 0.0;
+    if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return model;
 
-struct ParState {
-    const Matrix*     X;
-    const IVec*       y;
-    int               n;
-    SVMModel*         model;       // shared model weights (written only by thread 0)
-    Vec               gw;          // shared gradient accumulator for w
-    double            gb;          // shared gradient accumulator for b
-    double            loss;        // shared hinge loss accumulator
-    pthread_mutex_t   mutex;       // protects gw / gb / loss during accumulation
-    pthread_barrier_t barrier_acc; // all threads have added their local grad
-    pthread_barrier_t barrier_upd; // thread 0 has updated model; next epoch may begin
-};
+    std::vector<std::vector<double>> grad_by_thread(N_THREADS, std::vector<double>(n_features, 0.0));
+    std::vector<double> bias_grad_by_thread(N_THREADS, 0.0);
 
-struct TArg {
-    ParState* st;
-    int       tid;   // thread id in [0, N_THREADS)
-    int       s, e;  // exclusive slice [s, e) of training data
-};
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+        for (int t = 0; t < N_THREADS; ++t) {
+            std::fill(grad_by_thread[t].begin(), grad_by_thread[t].end(), 0.0);
+            bias_grad_by_thread[t] = 0.0;
+        }
 
-static void* svm_worker(void* raw) {
-    auto*      a  = static_cast<TArg*>(raw);
-    ParState*  st = a->st;
-    const Matrix& X = *st->X;
-    const IVec&   y = *st->y;
-    int n = st->n;
-
-    for (int epoch = 0; epoch < MAX_EPOCHS; ++epoch) {
-
-        // ── Step 1: compute local gradient and loss on this thread's slice ──
-        // Decaying learning rate: η_t = LR / sqrt(t + 1)
-        const double lr_t = LR / std::sqrt(static_cast<double>(epoch + 1));
-
-        Vec    lgw(N_FEATURES, 0.0);
-        double lgb   = 0.0;
-        double lloss = 0.0;
-
-        for (int i = a->s; i < a->e; ++i) {
-            // reads model->w and model->b which are stable (written only
-            // by thread 0 after barrier_upd, which all threads passed)
-            double margin = y[i] * (dot(st->model->w, X[i]) + st->model->b);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(N_THREADS)
+#endif
+        for (int i = 0; i < n_rows; ++i) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            const float* xi = &X[static_cast<size_t>(i) * n_features];
+            const double margin = static_cast<double>(y[i]) * (dot_row(model.w, xi, n_features) + model.b);
             if (margin < 1.0) {
-                lloss += 1.0 - margin;
-                for (int j = 0; j < N_FEATURES; ++j)
-                    lgw[j] += static_cast<double>(y[i]) * X[i][j];
-                lgb += static_cast<double>(y[i]);
+                const double yi = static_cast<double>(y[i]);
+                for (int j = 0; j < n_features; ++j) {
+                    grad_by_thread[tid][j] += yi * static_cast<double>(xi[j]);
+                }
+                bias_grad_by_thread[tid] += yi;
             }
         }
 
-        // ── Step 2: mutex-protected accumulation into shared gradient ────────
-        pthread_mutex_lock(&st->mutex);
-        for (int j = 0; j < N_FEATURES; ++j) st->gw[j] += lgw[j];
-        st->gb   += lgb;
-        st->loss += lloss;
-        pthread_mutex_unlock(&st->mutex);
-
-        // ── Step 3: wait for all threads to finish accumulation ──────────────
-        pthread_barrier_wait(&st->barrier_acc);
-
-        // ── Step 4: thread 0 applies the weight update and prints loss ───────
-        if (a->tid == 0) {
-            double total_loss = (LAMBDA / 2.0) * dot(st->model->w, st->model->w)
-                                + st->loss / n;
-            std::cout << "epoch " << epoch << "  loss=" << total_loss << "\n";
-
-            const double scale = 1.0 - lr_t * LAMBDA;
-            const double step  = lr_t / n;
-            for (int j = 0; j < N_FEATURES; ++j)
-                st->model->w[j] = scale * st->model->w[j] + step * st->gw[j];
-            st->model->b += step * st->gb;
-            // reset accumulators for next epoch
-            std::fill(st->gw.begin(), st->gw.end(), 0.0);
-            st->gb   = 0.0;
-            st->loss = 0.0;
+        std::vector<double> gw(n_features, 0.0);
+        double gb = 0.0;
+        for (int t = 0; t < N_THREADS; ++t) {
+            gb += bias_grad_by_thread[t];
+            for (int j = 0; j < n_features; ++j) gw[j] += grad_by_thread[t][j];
         }
 
-        // ── Step 5: all threads wait before starting next epoch ──────────────
-        pthread_barrier_wait(&st->barrier_upd);
+        const double scale = 1.0 - lr * lambda;
+        const double step = lr / static_cast<double>(n_rows);
+        for (int j = 0; j < n_features; ++j) {
+            model.w[j] = scale * model.w[j] + step * gw[j];
+        }
+        model.b += step * gb;
     }
-
-    return nullptr;
-}
-
-SVMModel train_parallel(const Matrix& X, const IVec& y) {
-    int n = static_cast<int>(X.size());
-    SVMModel model;
-
-    ParState st;
-    st.X     = &X;
-    st.y     = &y;
-    st.n     = n;
-    st.model = &model;
-    st.gw    = Vec(N_FEATURES, 0.0);
-    st.gb    = 0.0;
-    st.loss  = 0.0;
-
-    pthread_mutex_init(&st.mutex, nullptr);
-    pthread_barrier_init(&st.barrier_acc, nullptr, static_cast<unsigned>(N_THREADS));
-    pthread_barrier_init(&st.barrier_upd, nullptr, static_cast<unsigned>(N_THREADS));
-
-    std::vector<TArg>     args(N_THREADS);
-    std::vector<pthread_t> threads(N_THREADS);
-    int chunk = n / N_THREADS;
-
-    for (int t = 0; t < N_THREADS; ++t) {
-        args[t].st  = &st;
-        args[t].tid = t;
-        args[t].s   = t * chunk;
-        args[t].e   = (t == N_THREADS - 1) ? n : (t + 1) * chunk;
-        pthread_create(&threads[t], nullptr, svm_worker, &args[t]);
-    }
-    for (int t = 0; t < N_THREADS; ++t) pthread_join(threads[t], nullptr);
-
-    pthread_mutex_destroy(&st.mutex);
-    pthread_barrier_destroy(&st.barrier_acc);
-    pthread_barrier_destroy(&st.barrier_upd);
 
     return model;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Printing Results
-// ─────────────────────────────────────────────────────────────────────────────
+static Labels predict_serial(const SVMModel& model,
+                             const std::vector<float>& X,
+                             int n_rows,
+                             int n_features) {
+    Labels out(n_rows);
+    for (int i = 0; i < n_rows; ++i) {
+        const float* xi = &X[static_cast<size_t>(i) * n_features];
+        out[i] = (dot_row(model.w, xi, n_features) + model.b >= 0.0) ? 1 : -1;
+    }
+    return out;
+}
+
+static Labels predict_parallel(const SVMModel& model,
+                               const std::vector<float>& X,
+                               int n_rows,
+                               int n_features) {
+    Labels out(n_rows);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(N_THREADS)
+#endif
+    for (int i = 0; i < n_rows; ++i) {
+        const float* xi = &X[static_cast<size_t>(i) * n_features];
+        out[i] = (dot_row(model.w, xi, n_features) + model.b >= 0.0) ? 1 : -1;
+    }
+    return out;
+}
+
+static Metrics evaluate(const Labels& truth, const Labels& pred) {
+    int tp = 0, fp = 0, tn = 0, fn = 0;
+    for (int i = 0; i < static_cast<int>(truth.size()); ++i) {
+        if (truth[i] == 1 && pred[i] == 1)
+            ++tp;
+        else if (truth[i] == -1 && pred[i] == 1)
+            ++fp;
+        else if (truth[i] == -1 && pred[i] == -1)
+            ++tn;
+        else
+            ++fn;
+    }
+
+    Metrics m;
+    m.acc = static_cast<double>(tp + tn) / static_cast<double>(truth.size());
+    m.prec = (tp + fp) ? static_cast<double>(tp) / (tp + fp) : 0.0;
+    m.rec = (tp + fn) ? static_cast<double>(tp) / (tp + fn) : 0.0;
+    m.f1 = (m.prec + m.rec) ? (2.0 * m.prec * m.rec / (m.prec + m.rec)) : 0.0;
+    return m;
+}
 
 static void print_results(const std::string& tag,
-                           double train_ms, double infer_ms,
-                           const Metrics& m) {
-    std::cout << std::left << std::setw(40) << ("[" + tag + "]") << "\n";
+                          double train_ms,
+                          double infer_ms,
+                          const Metrics& m) {
+    std::cout << "[" << tag << "]\n";
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "  Training time    : " << std::setw(10) << train_ms << " ms\n";
-    std::cout << "  Inference time   : " << std::setw(10) << infer_ms << " ms\n";
-    std::cout << "  Total time       : " << std::setw(10) << (train_ms + infer_ms) << " ms\n";
+    std::cout << "  Training time  : " << train_ms << " ms\n";
+    std::cout << "  Inference time : " << infer_ms << " ms\n";
+    std::cout << "  Total time     : " << (train_ms + infer_ms) << " ms\n";
     std::cout << std::setprecision(4);
-    std::cout << "  Accuracy         : " << m.acc  << "\n";
-    std::cout << "  Precision        : " << m.prec << "\n";
-    std::cout << "  Recall           : " << m.rec  << "\n";
-    std::cout << "  F1 Score         : " << m.f1   << "\n\n";
+    std::cout << "  Accuracy       : " << m.acc << "\n";
+    std::cout << "  Precision      : " << m.prec << "\n";
+    std::cout << "  Recall         : " << m.rec << "\n";
+    std::cout << "  F1 Score       : " << m.f1 << "\n\n";
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Main
-// ─────────────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
     std::string train_csv = "train_cleaned.csv";
-    std::string test_csv  = "test_cleaned.csv";
-    if (argc > 1) train_csv = argv[1];
-    if (argc > 2) test_csv  = argv[2];
+    std::string test_csv = "test_cleaned.csv";
+    int epochs = MAX_EPOCHS;
+    double lr = LR;
+    double lambda = LAMBDA;
 
-    std::cout << "╔══════════════════════════════════════════════════╗\n";
-    std::cout << "║  SVM — CS:GO Round Winner Classification         ║\n";
-    std::cout << "╚══════════════════════════════════════════════════╝\n";
-    std::cout << "Config: epochs=" << MAX_EPOCHS
-              << "  lr="     << LR
-              << "  lambda=" << LAMBDA
+    if (argc > 1) train_csv = argv[1];
+    if (argc > 2) test_csv = argv[2];
+    if (argc > 3) epochs = std::max(0, parse_int_or_default(argv[3], MAX_EPOCHS, "epochs"));
+    if (argc > 4) lr = std::max(0.0, parse_double_or_default(argv[4], LR, "lr"));
+    if (argc > 5) lambda = std::max(0.0, parse_double_or_default(argv[5], LAMBDA, "lambda"));
+
+    std::cout << "SVM - CS:GO Round Winner Classification\n";
+    std::cout << "Config: epochs=" << epochs
+              << "  lr=" << lr
+              << "  lambda=" << lambda
               << "  threads=" << N_THREADS << "\n\n";
 
-    // ── Load data ────────────────────────────────────────────────────────────
-    double t_load_start = now_ms();
+    const double t0 = now_ms();
     Dataset ds = load_dataset(train_csv, test_csv);
-    double t_load_end = now_ms();
+    const double t1 = now_ms();
     std::cout << std::fixed << std::setprecision(2)
-              << "Data loading: " << (t_load_end - t_load_start) << " ms\n\n";
-    
+              << "Data loading + normalization: " << (t1 - t0) << " ms\n\n";
 
-    // ── Serial SVM ───────────────────────────────────────────────────────────
-    double ts0 = now_ms();
-    SVMModel serial_model = train_serial(ds.X_train, ds.y_train);
-    double ts1 = now_ms();
-    IVec serial_preds = predict_serial(serial_model, ds.X_test);
-    double ts2 = now_ms();
+    const int n_test = static_cast<int>(ds.y_test.size());
+    const int n_train = static_cast<int>(ds.y_train.size());
 
-    Metrics sm = evaluate(ds.y_test, serial_preds);
+    const double ts0 = now_ms();
+    SVMModel serial_model = train_serial(ds.X_train, ds.y_train, n_train, ds.n_features, epochs, lr, lambda);
+    const double ts1 = now_ms();
+    Labels serial_pred = predict_serial(serial_model, ds.X_test, n_test, ds.n_features);
+    const double ts2 = now_ms();
+    Metrics sm = evaluate(ds.y_test, serial_pred);
     print_results("Serial SVM", ts1 - ts0, ts2 - ts1, sm);
 
-    // ── Better Serial SVM ────────────────────────────────────────────────────
-    double tb0 = now_ms();
-    SVMModel better_model = train_better_serial(ds.X_train, ds.y_train);
-    double tb1 = now_ms();
-    IVec better_preds = predict_serial(better_model, ds.X_test);
-    double tb2 = now_ms();
+    const double tp0 = now_ms();
+    SVMModel parallel_model = train_parallel(ds.X_train, ds.y_train, n_train, ds.n_features, epochs, lr, lambda);
+    const double tp1 = now_ms();
+    Labels parallel_pred = predict_parallel(parallel_model, ds.X_test, n_test, ds.n_features);
+    const double tp2 = now_ms();
+    Metrics pm = evaluate(ds.y_test, parallel_pred);
+    print_results("Parallel SVM (OpenMP, " + std::to_string(N_THREADS) + " threads)",
+                  tp1 - tp0,
+                  tp2 - tp1,
+                  pm);
 
-    Metrics bm = evaluate(ds.y_test, better_preds);
-    print_results("Better Serial SVM (shuffled + decaying LR)", tb1 - tb0, tb2 - tb1, bm);
+    const double serial_total = (ts1 - ts0) + (ts2 - ts1);
+    const double parallel_total = (tp1 - tp0) + (tp2 - tp1);
 
-    // ── Parallel SVM ─────────────────────────────────────────────────────────
-    double tp0 = now_ms();
-    SVMModel parallel_model = train_parallel(ds.X_train, ds.y_train);
-    double tp1 = now_ms();
-    IVec parallel_preds = predict_parallel(parallel_model, ds.X_test);
-    double tp2 = now_ms();
-
-    Metrics pm = evaluate(ds.y_test, parallel_preds);
-    print_results("Parallel SVM (" + std::to_string(N_THREADS) + " threads, pthreads+OpenMP)",
-                  tp1 - tp0, tp2 - tp1, pm);
-
-    // ── Speedup summary ──────────────────────────────────────────────────────
-    double serial_total   = (ts1 - ts0) + (ts2 - ts1);
-    double serial_better_total = (tb1 - tb0) + (tb2 - tb1);
-    double parallel_total = (tp1 - tp0) + (tp2 - tp1);
-
-    std::cout << "┌─────────────────────────────────────────────────┐\n";
-    std::cout << "│  Speedup Analysis                               │\n";
-    std::cout << "├─────────────────────────────────────────────────┤\n";
+    std::cout << "Speedup Summary\n";
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "│  Serial total    : " << std::setw(10) << serial_total
-              << " ms\n";
-    std::cout << "│  Better Serial   : " << std::setw(10) << serial_better_total
-              << " ms\n";
-    std::cout << "│  Parallel total  : " << std::setw(10) << parallel_total
-              << " ms\n";
-    std::cout << "│  Speedup         : " << std::setw(10)
-              << (serial_better_total / parallel_total) << " x\n";
-    std::cout << "│  Threads used    : " << std::setw(10) << N_THREADS
-              << " \n";
-    std::cout << "└─────────────────────────────────────────────────┘\n";
+    std::cout << "  Serial total   : " << serial_total << " ms\n";
+    std::cout << "  Parallel total : " << parallel_total << " ms\n";
+    std::cout << "  Speedup        : "
+              << (parallel_total > 0.0 ? serial_total / parallel_total : 0.0)
+              << " x\n";
 
     return 0;
 }

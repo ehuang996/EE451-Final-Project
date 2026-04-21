@@ -1,10 +1,10 @@
 // =============================================================================
-// knn.cpp - Serial and Parallel KNN (pure C++17 + OpenMP)
+// knn.cpp - Serial and Parallel KNN with epoch/lr prototype adaptation
 // Dataset : train_cleaned.csv / test_cleaned.csv
 // Label   : round_winner in {+1, -1}
 // =============================================================================
-// g++ -std=c++17 -O3 -march=native -fopenmp knn.cpp knn
-// knn train_cleaned.csv test_cleaned.csv
+// g++ -std=c++17 -O3 -march=native -fopenmp knn.cpp -o knn
+// ./knn train_cleaned.csv test_cleaned.csv [epochs] [lr] [k]
 
 #include <algorithm>
 #include <chrono>
@@ -24,6 +24,8 @@
 
 static constexpr int K_NEIGHBORS = 11;
 static constexpr int N_THREADS = 8;
+static constexpr int MAX_EPOCHS = 20;
+static constexpr double LR = 0.02;
 
 using Labels = std::vector<int>;
 
@@ -42,11 +44,17 @@ struct Metrics {
     double f1 = 0.0;
 };
 
+struct KNNModel {
+    std::vector<float> X;
+    Labels y;
+    int n_rows = 0;
+    int n_features = 0;
+    int k = K_NEIGHBORS;
+};
+
 static double now_ms() {
     using clock = std::chrono::high_resolution_clock;
-    return std::chrono::duration<double, std::milli>(
-               clock::now().time_since_epoch())
-        .count();
+    return std::chrono::duration<double, std::milli>(clock::now().time_since_epoch()).count();
 }
 
 static std::vector<std::string> split_csv(const std::string& line) {
@@ -64,6 +72,24 @@ static std::string resolve_path(const std::string& path) {
     return path;
 }
 
+static int parse_int_or_default(const char* raw, int fallback, const char* name) {
+    try {
+        return std::stoi(raw);
+    } catch (...) {
+        std::cerr << "Warning: invalid " << name << "='" << raw << "', using " << fallback << ".\n";
+        return fallback;
+    }
+}
+
+static double parse_double_or_default(const char* raw, double fallback, const char* name) {
+    try {
+        return std::stod(raw);
+    } catch (...) {
+        std::cerr << "Warning: invalid " << name << "='" << raw << "', using " << fallback << ".\n";
+        return fallback;
+    }
+}
+
 static void load_csv_rows(const std::string& path,
                           int label_col,
                           int n_features,
@@ -77,7 +103,6 @@ static void load_csv_rows(const std::string& path,
 
     std::string line;
     std::getline(file, line);  // skip header
-
     while (std::getline(file, line)) {
         if (line.empty()) continue;
         std::stringstream ss(line);
@@ -95,6 +120,7 @@ static void load_csv_rows(const std::string& path,
             }
             ++col;
         }
+
         if (feat_count != n_features) {
             std::cerr << "Error: row has " << feat_count
                       << " features, expected " << n_features << "\n";
@@ -121,6 +147,7 @@ static Dataset load_dataset(const std::string& train_path_in,
         std::cerr << "Error: training file is empty: " << train_path << "\n";
         std::exit(1);
     }
+
     auto cols = split_csv(train_header);
     int label_col = -1;
     for (int i = 0; i < static_cast<int>(cols.size()); ++i) {
@@ -133,6 +160,7 @@ static Dataset load_dataset(const std::string& train_path_in,
         std::cerr << "Error: column 'round_winner' not found in training header.\n";
         std::exit(1);
     }
+
     ds.n_features = static_cast<int>(cols.size()) - 1;
     train_file.close();
 
@@ -142,7 +170,6 @@ static Dataset load_dataset(const std::string& train_path_in,
     const int n_train = static_cast<int>(ds.y_train.size());
     const int n_test = static_cast<int>(ds.y_test.size());
 
-    // Standardize with train statistics only.
     std::vector<double> mean(ds.n_features, 0.0);
     std::vector<double> sd(ds.n_features, 0.0);
 
@@ -188,33 +215,145 @@ static Dataset load_dataset(const std::string& train_path_in,
     return ds;
 }
 
-struct KNNModel {
-    const std::vector<float>* X = nullptr;
-    const Labels* y = nullptr;
-    int n_rows = 0;
-    int n_features = 0;
-    int k = K_NEIGHBORS;
-};
+static void adapt_prototypes_serial(std::vector<float>& X,
+                                    const Labels& y,
+                                    int n_rows,
+                                    int n_features,
+                                    int epochs,
+                                    double lr) {
+    if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return;
+
+    std::vector<double> pos_centroid(n_features, 0.0);
+    std::vector<double> neg_centroid(n_features, 0.0);
+
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+        std::fill(pos_centroid.begin(), pos_centroid.end(), 0.0);
+        std::fill(neg_centroid.begin(), neg_centroid.end(), 0.0);
+        int pos_count = 0;
+        int neg_count = 0;
+
+        for (int i = 0; i < n_rows; ++i) {
+            const float* row = &X[static_cast<size_t>(i) * n_features];
+            if (y[i] == 1) {
+                ++pos_count;
+                for (int j = 0; j < n_features; ++j) pos_centroid[j] += row[j];
+            } else {
+                ++neg_count;
+                for (int j = 0; j < n_features; ++j) neg_centroid[j] += row[j];
+            }
+        }
+
+        if (pos_count == 0 || neg_count == 0) break;
+        for (int j = 0; j < n_features; ++j) {
+            pos_centroid[j] /= pos_count;
+            neg_centroid[j] /= neg_count;
+        }
+
+        for (int i = 0; i < n_rows; ++i) {
+            float* row = &X[static_cast<size_t>(i) * n_features];
+            const std::vector<double>& target = (y[i] == 1) ? pos_centroid : neg_centroid;
+            for (int j = 0; j < n_features; ++j) {
+                row[j] = static_cast<float>(row[j] + lr * (target[j] - row[j]));
+            }
+        }
+    }
+}
+
+static void adapt_prototypes_parallel(std::vector<float>& X,
+                                      const Labels& y,
+                                      int n_rows,
+                                      int n_features,
+                                      int epochs,
+                                      double lr) {
+    if (n_rows == 0 || n_features == 0 || epochs <= 0 || lr <= 0.0) return;
+
+    for (int epoch = 0; epoch < epochs; ++epoch) {
+        std::vector<std::vector<double>> pos_sum(N_THREADS, std::vector<double>(n_features, 0.0));
+        std::vector<std::vector<double>> neg_sum(N_THREADS, std::vector<double>(n_features, 0.0));
+        std::vector<int> pos_count(N_THREADS, 0);
+        std::vector<int> neg_count(N_THREADS, 0);
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(N_THREADS)
+#endif
+        for (int i = 0; i < n_rows; ++i) {
+            int tid = 0;
+#ifdef _OPENMP
+            tid = omp_get_thread_num();
+#endif
+            const float* row = &X[static_cast<size_t>(i) * n_features];
+            if (y[i] == 1) {
+                ++pos_count[tid];
+                for (int j = 0; j < n_features; ++j) pos_sum[tid][j] += row[j];
+            } else {
+                ++neg_count[tid];
+                for (int j = 0; j < n_features; ++j) neg_sum[tid][j] += row[j];
+            }
+        }
+
+        std::vector<double> pos_centroid(n_features, 0.0);
+        std::vector<double> neg_centroid(n_features, 0.0);
+        int total_pos = 0;
+        int total_neg = 0;
+
+        for (int t = 0; t < N_THREADS; ++t) {
+            total_pos += pos_count[t];
+            total_neg += neg_count[t];
+            for (int j = 0; j < n_features; ++j) {
+                pos_centroid[j] += pos_sum[t][j];
+                neg_centroid[j] += neg_sum[t][j];
+            }
+        }
+
+        if (total_pos == 0 || total_neg == 0) break;
+        for (int j = 0; j < n_features; ++j) {
+            pos_centroid[j] /= total_pos;
+            neg_centroid[j] /= total_neg;
+        }
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(N_THREADS)
+#endif
+        for (int i = 0; i < n_rows; ++i) {
+            float* row = &X[static_cast<size_t>(i) * n_features];
+            const std::vector<double>& target = (y[i] == 1) ? pos_centroid : neg_centroid;
+            for (int j = 0; j < n_features; ++j) {
+                row[j] = static_cast<float>(row[j] + lr * (target[j] - row[j]));
+            }
+        }
+    }
+}
 
 static KNNModel train_serial(const std::vector<float>& X,
                              const Labels& y,
                              int n_features,
-                             int k) {
+                             int k,
+                             int epochs,
+                             double lr) {
     KNNModel m;
-    m.X = &X;
-    m.y = &y;
+    m.X = X;
+    m.y = y;
     m.n_rows = static_cast<int>(y.size());
     m.n_features = n_features;
-    m.k = std::min(k, m.n_rows);
+    m.k = std::min(std::max(k, 1), m.n_rows);
+    adapt_prototypes_serial(m.X, m.y, m.n_rows, m.n_features, epochs, lr);
     return m;
 }
 
 static KNNModel train_parallel(const std::vector<float>& X,
                                const Labels& y,
                                int n_features,
-                               int k) {
-    // KNN is a lazy learner; "training" stores the normalized data.
-    return train_serial(X, y, n_features, k);
+                               int k,
+                               int epochs,
+                               double lr) {
+    KNNModel m;
+    m.X = X;
+    m.y = y;
+    m.n_rows = static_cast<int>(y.size());
+    m.n_features = n_features;
+    m.k = std::min(std::max(k, 1), m.n_rows);
+    adapt_prototypes_parallel(m.X, m.y, m.n_rows, m.n_features, epochs, lr);
+    return m;
 }
 
 static inline double squared_l2(const float* a, const float* b, int n_features) {
@@ -233,8 +372,8 @@ static int predict_one(const KNNModel& model, const float* xq) {
 
     int max_idx = 0;
     double max_dist = best_dist[0];
-    const auto& X = *model.X;
-    const auto& y = *model.y;
+    const auto& X = model.X;
+    const auto& y = model.y;
 
     for (int i = 0; i < model.n_rows; ++i) {
         const float* xi = &X[static_cast<size_t>(i) * model.n_features];
@@ -277,8 +416,7 @@ static int predict_one(const KNNModel& model, const float* xq) {
 }
 
 static Labels predict_serial(const KNNModel& model, const std::vector<float>& X_test, int n_test) {
-    Labels pred;
-    pred.resize(n_test);
+    Labels pred(n_test);
     for (int i = 0; i < n_test; ++i) {
         const float* xq = &X_test[static_cast<size_t>(i) * model.n_features];
         pred[i] = predict_one(model, xq);
@@ -338,13 +476,21 @@ static void print_results(const std::string& tag,
 int main(int argc, char* argv[]) {
     std::string train_csv = "train_cleaned.csv";
     std::string test_csv = "test_cleaned.csv";
+    int epochs = MAX_EPOCHS;
+    double lr = LR;
+    int k = K_NEIGHBORS;
+
     if (argc > 1) train_csv = argv[1];
     if (argc > 2) test_csv = argv[2];
+    if (argc > 3) epochs = std::max(0, parse_int_or_default(argv[3], MAX_EPOCHS, "epochs"));
+    if (argc > 4) lr = std::max(0.0, parse_double_or_default(argv[4], LR, "lr"));
+    if (argc > 5) k = std::max(1, parse_int_or_default(argv[5], K_NEIGHBORS, "k"));
 
     std::cout << "KNN - CS:GO Round Winner Classification\n";
-    std::cout << "Config: k=" << K_NEIGHBORS
+    std::cout << "Config: k=" << k
               << "  distance=squared_euclidean"
-              << "  epochs=N/A (lazy learner)"
+              << "  epochs=" << epochs
+              << "  lr=" << lr
               << "  threads=" << N_THREADS << "\n\n";
 
     const double t0 = now_ms();
@@ -356,7 +502,7 @@ int main(int argc, char* argv[]) {
     const int n_test = static_cast<int>(ds.y_test.size());
 
     const double ts0 = now_ms();
-    KNNModel serial_model = train_serial(ds.X_train, ds.y_train, ds.n_features, K_NEIGHBORS);
+    KNNModel serial_model = train_serial(ds.X_train, ds.y_train, ds.n_features, k, epochs, lr);
     const double ts1 = now_ms();
     Labels serial_pred = predict_serial(serial_model, ds.X_test, n_test);
     const double ts2 = now_ms();
@@ -364,7 +510,7 @@ int main(int argc, char* argv[]) {
     print_results("Serial KNN", ts1 - ts0, ts2 - ts1, sm);
 
     const double tp0 = now_ms();
-    KNNModel parallel_model = train_parallel(ds.X_train, ds.y_train, ds.n_features, K_NEIGHBORS);
+    KNNModel parallel_model = train_parallel(ds.X_train, ds.y_train, ds.n_features, k, epochs, lr);
     const double tp1 = now_ms();
     Labels parallel_pred = predict_parallel(parallel_model, ds.X_test, n_test);
     const double tp2 = now_ms();
@@ -376,6 +522,7 @@ int main(int argc, char* argv[]) {
 
     const double serial_total = (ts1 - ts0) + (ts2 - ts1);
     const double parallel_total = (tp1 - tp0) + (tp2 - tp1);
+
     std::cout << "Speedup Summary\n";
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "  Serial total   : " << serial_total << " ms\n";
@@ -386,4 +533,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
