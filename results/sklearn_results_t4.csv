@@ -1,9 +1,9 @@
 algorithm,framework,variant,n_threads,train_ms,infer_ms,acc,prec,rec,f1,notes
-svm,sklearn,default,1,750.48,1.66,0.7315,0.7216,0.7379,0.7296,SGDClassifier single-threaded by design
-knn,sklearn,default,4,23.48,5761.07,0.8106,0.8096,0.8031,0.8064,"brute-force, n_jobs=4"
-mlp,sklearn,default,4,12323.38,9.18,0.7546,0.7357,0.7807,0.7575,BLAS-parallel via OMP_NUM_THREADS=4
-dt,sklearn,default,1,1076.34,3.66,0.7652,0.7537,0.7752,0.7643,exact-split single-threaded; sklearn DT has no n_jobs
-dt,xgboost,default,4,271.28,5.21,0.7632,0.7411,0.7959,0.7675,"hist single-tree, max_bin=64, n_jobs=4"
-nb,sklearn,hybrid,1,103.47,9.77,0.6946,0.6407,0.8608,0.7346,GaussianNB+BernoulliNB composed; matches nb.cpp is_binary mask
-nb,sklearn,gaussian-only,1,81.15,9.79,0.643,0.7822,0.3784,0.51,naive-sklearn-user baseline; Gaussian applied to all features
-nb,sklearn,bernoulli-only,1,113.94,23.42,0.7024,0.7088,0.6685,0.6881,naive-sklearn-user baseline; Bernoulli applied to all features
+svm,sklearn,default,1,804.21,1.79,0.7315,0.7216,0.7379,0.7296,SGDClassifier single-threaded by design
+knn,sklearn,default,4,24.75,5656.51,0.8106,0.8096,0.8031,0.8064,"brute-force, n_jobs=4"
+mlp,sklearn,default,4,12669.4,10.1,0.7546,0.7357,0.7807,0.7575,BLAS-parallel via OMP_NUM_THREADS=4
+dt,sklearn,default,1,1133.71,4.07,0.7652,0.7537,0.7752,0.7643,exact-split single-threaded; sklearn DT has no n_jobs
+dt,xgboost,default,4,276.96,5.18,0.7632,0.7411,0.7959,0.7675,"hist single-tree, max_bin=64, n_jobs=4"
+nb,sklearn,hybrid,1,106.86,9.85,0.6946,0.6407,0.8608,0.7346,GaussianNB+BernoulliNB composed; matches nb.cpp is_binary mask
+nb,sklearn,gaussian-only,1,83.9,9.73,0.643,0.7822,0.3784,0.51,naive-sklearn-user baseline; Gaussian applied to all features
+nb,sklearn,bernoulli-only,1,115.57,25.01,0.7024,0.7088,0.6685,0.6881,naive-sklearn-user baseline; Bernoulli applied to all features
