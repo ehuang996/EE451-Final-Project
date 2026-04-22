@@ -18,7 +18,7 @@ The proposal's hypothesis pairs KNN with NB as algorithms that will hit
 arithmetic-intensity. In practice KNN turned out to scale **best of the five**
 at 8 threads, because at our problem size the triple-nested distance loop is
 actually compute-bound — bandwidth would only bite at 32+ threads. Details in
-[results/results.md §"Hypothesis vs reality"](../results/results.md).
+[results/run2/results.md §"Hypothesis vs reality"](../results/run2/results.md).
 
 **Key cross-framework finding.** Sklearn's `algorithm="brute"` KNN beat the
 original pure C++ implementation by 16× at T=8 — but *not* because sklearn was
@@ -659,7 +659,7 @@ Append one row per CARC run.
 
 | date (UTC) | git SHA | k | machine/cores | serial (s) | omp (s) | pth (s) | acc_serial | acc_omp | acc_pth | speedup_omp | speedup_pth | notes |
 |------------|---------|:-:|---------------|-----------:|--------:|--------:|:----------:|:-------:|:-------:|:-----------:|:-----------:|-------|
-| 2026-04-20 | 526bb18 | 11 | CARC d17-03 / 8 | 323.02 | 50.52 | 51.55 | 0.8104 | 0.8104 | 0.8104 | 6.39× | 6.26× | Full `{1,2,4,8}` sweep, job 3272373. **Highest speedup of the five** — proposal's "memory-bound, plateaus early" hypothesis was wrong at T=8. Accuracy is the highest of the five. vs sklearn brute (T=8) **ours is 16× slower** because sklearn reformulates the distance matrix as a GEMM (`X_test @ X_train.T`) through OpenBLAS; at T=1 sklearn already beats us 16.4×. Scaling is identical on both sides (~6.2× per thread octave). See [results/results.md §"Key insight"](../results/results.md). |
+| 2026-04-20 | 526bb18 | 11 | CARC d17-03 / 8 | 323.02 | 50.52 | 51.55 | 0.8104 | 0.8104 | 0.8104 | 6.39× | 6.26× | Full `{1,2,4,8}` sweep, job 3272373. **Highest speedup of the five** — proposal's "memory-bound, plateaus early" hypothesis was wrong at T=8. Accuracy is the highest of the five. vs sklearn brute (T=8) **ours is 16× slower** because sklearn reformulates the distance matrix as a GEMM (`X_test @ X_train.T`) through OpenBLAS; at T=1 sklearn already beats us 16.4×. Scaling is identical on both sides (~6.2× per thread octave). See [results/run2/results.md §"Key insight"](../results/run2/results.md). |
 
 ### Local optimization checks (not CARC-comparable)
 

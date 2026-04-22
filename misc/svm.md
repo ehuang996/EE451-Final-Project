@@ -409,7 +409,7 @@ Append one row per CARC run.
 
 | date (UTC) | git SHA | epochs | machine/cores | serial (s) | omp (s) | pth (s) | acc_serial | acc_omp | acc_pth | speedup_omp | speedup_pth | notes |
 |------------|---------|:------:|---------------|-----------:|--------:|--------:|:----------:|:-------:|:-------:|:-----------:|:-----------:|-------|
-| 2026-04-20 | 526bb18 | 20 | CARC d17-03 / 8 | 0.333 | 0.080 | 0.055 | 0.7301 | 0.7301 | 0.7301 | 4.15× | 6.02× | Full `{1,2,4,8}` sweep, job 3272373. Proposal's "synchronization-limited" prediction was **wrong** — SVM placed 2nd at 6.02× because full-batch GD has only 20 sync events total. **pthreads beats OMP by the widest margin of the five** (6.02× vs 4.15×): with 20 epochs, OMP pays 20 team-creation costs while pthreads pays 1. vs sklearn `SGDClassifier` (single-threaded) **ours is 13.6× faster**. See [results/results.md](../results/results.md). |
+| 2026-04-20 | 526bb18 | 20 | CARC d17-03 / 8 | 0.333 | 0.080 | 0.055 | 0.7301 | 0.7301 | 0.7301 | 4.15× | 6.02× | Full `{1,2,4,8}` sweep, job 3272373. Proposal's "synchronization-limited" prediction was **wrong** — SVM placed 2nd at 6.02× because full-batch GD has only 20 sync events total. **pthreads beats OMP by the widest margin of the five** (6.02× vs 4.15×): with 20 epochs, OMP pays 20 team-creation costs while pthreads pays 1. vs sklearn `SGDClassifier` (single-threaded) **ours is 13.6× faster**. See [results/run1/results.md](../results/run1/results.md). |
 
 ---
 
