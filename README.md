@@ -37,8 +37,8 @@ encoding the map feature, each record has 103 numeric features.
 | Support Vector Machine | [src/cpp/svm/svm.cpp](src/cpp/svm/svm.cpp) | Complete     | Harry   |
 | K-Nearest Neighbors    | [src/cpp/knn/knn.cpp](src/cpp/knn/knn.cpp) | Complete     | Mo      |
 | Multilayer Perceptron  | [src/cpp/mlp/mlp.cpp](src/cpp/mlp/mlp.cpp) | Complete     | Eric    |
-| Decision Tree          | [src/cpp/dt/dt.cpp](src/cpp/dt/dt.cpp)     | Complete     | Eric    |
-| Naive Bayes            | [src/cpp/nb/nb.cpp](src/cpp/nb/nb.cpp)     | Complete     | Eric    |
+| Decision Tree          | [src/cpp/dt/dt.cpp](src/cpp/dt/dt.cpp)     | Complete     | Eric, Jinglu|
+| Naive Bayes            | [src/cpp/nb/nb.cpp](src/cpp/nb/nb.cpp)     | Complete     | Eric, Pinru|
 | Benchmark driver       | [analytics_engine.cpp](analytics_engine.cpp) | Complete   | Eric    |
 | sklearn/XGBoost baselines | [src/sklearn_xgb/](src/sklearn_xgb/)    | Complete     | Eric    |
 
