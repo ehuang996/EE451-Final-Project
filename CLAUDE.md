@@ -4,46 +4,59 @@ Guidance for Claude Code when working in this repo.
 
 ## Project
 
-EE 451 (USC, Distributed & Parallel Computing) **final project**: a from-scratch, pure-C++17 empirical study of five classical ML algorithms parallelized with OpenMP + pthreads, benchmarked on the **CS:GO Round Winner** dataset.
+EE 451 (USC, Distributed & Parallel Computing) **final project**: a C++17 empirical study of five classical ML algorithms parallelized with OpenMP + pthreads, benchmarked on the **CS:GO Round Winner** dataset.
 
 - Binary classification: `round_winner ∈ {+1, −1}` from 103 numeric features.
-- Train: ~97,929 rows in [data/train_cleaned.csv](data/train_cleaned.csv). Test: ~24,483 rows in [data/test_cleaned.csv](data/test_cleaned.csv).
+- Train: 97,928 data rows in [data/train_cleaned.csv](data/train_cleaned.csv) plus header. Test: 24,482 data rows in [data/test_cleaned.csv](data/test_cleaned.csv) plus header.
 - Target per-model accuracy: **76–80%** (community benchmark).
 - Parallelism target: **8 threads** (SLURM `--cpus-per-task=8`).
 - Hardware: USC CARC cluster; local builds are a convenience, not required.
 
-The five algorithms: **KNN, SVM, Naive Bayes, Decision Tree, MLP**. Each is a single, self-contained `.cpp` file with a shared public interface (`load_dataset`, `train_serial`, `train_parallel_omp`, `train_parallel_pthreads`, `predict_serial`, `predict_parallel`, `evaluate`). [analytics_engine.cpp](analytics_engine.cpp) drives all five as subprocesses and emits `analytics_results.csv` for the writeup's comparison tables.
+The latest report is [EE451-Final-Paper/main.pdf](EE451-Final-Paper/main.pdf). Treat that PDF as the source of truth for the final paper narrative and numbers. The report covers two CARC sweeps:
+
+- **Run 1 / Sweep 1** (`results/run1/`, job `3272373`): archived pure-C++ sweep for all five algorithms.
+- **Run 2 / Sweep 2** (`results/run2/`, job `3278100`): current code path. SVM, DT, and NB remain pure C++; KNN and MLP use vendor BLAS for dense inner kernels.
+
+Unless a result is explicitly labeled **pure C++** or **Run 1**, assume it refers to Run 2. The central final result is that kernel formulation comes first: BLAS reformulation flips KNN from a 16x loss to a 2.2x win over scikit-learn, while MLP gets much faster in absolute time but loses 8-thread speedup because the GEMMs are too small for threaded BLAS to pay off.
+
+The five algorithms: **KNN, SVM, Naive Bayes, Decision Tree, MLP**. Each is a single, self-contained `.cpp` file with a shared conceptual interface (`load_dataset`, serial and parallel train/predict entry points, `evaluate`, and standardized `[tag]` output). [analytics_engine.cpp](analytics_engine.cpp) drives all five as subprocesses and emits `analytics_results.csv` / sweep CSVs for the writeup's comparison tables.
 
 Team: Eric Huang (MLP, DT, NB, analytics_engine, sklearn_xgb), Harry Yang (SVM), Jinglu Sun, Mo Jiang (KNN), Pinru Wang.
 
 ## Repo layout
 
 ```
-├── 451 project proposal.pdf   ← project proposal (read this for context)
-├── proposal.tex               ← LaTeX source
+├── 451 project proposal.pdf   ← original project proposal, useful historical context
 ├── README.md                  ← user-facing overview; read alongside this file
 ├── CLAUDE.md                  ← this file
 ├── analytics_engine.cpp       ← subprocess driver; parses each binary's stdout
-├── job.sl                     ← SLURM: compiles + runs all five
-├── job_analytics.sl           ← SLURM: runs analytics_engine across all five
+├── slurm/
+│   ├── job.sl                 ← SLURM: compiles + runs all five with run2 defaults
+│   ├── job_analytics.sl       ← SLURM: runs analytics_engine across all five
+│   └── job_sweep.sl           ← SLURM: {1,2,4,8}-thread C++ + sklearn/XGBoost sweep
 ├── split_data.sh              ← 80/20 shuffle-split of the raw Kaggle CSV
 ├── data/
-│   ├── train_cleaned.csv      ← 97929 × 104
-│   ├── test_cleaned.csv       ← 24483  × 104
+│   ├── train_cleaned.csv      ← 97,928 rows + header, 103 features + label
+│   ├── test_cleaned.csv       ← 24,482 rows + header, 103 features + label
 │   └── cs_go_winner_data_{train,test}.csv   ← raw pre-cleaning splits
 ├── src/
 │   ├── cpp/
 │   │   ├── svm/  ← Harry. Linear SVM, hinge + L2. svm.cpp + job_svm.sl + Data.ipynb
-│   │   ├── knn/  ← Mo.    Squared-L2 k-NN. knn.cpp + job_knn.sl
-│   │   ├── mlp/  ← Eric.  103→64→32→1, BCE + momentum. mlp.cpp + job_mlp.sl
+│   │   ├── knn/  ← Mo.    BLAS-backed squared-L2 k-NN. knn.cpp + job_knn.sl
+│   │   ├── mlp/  ← Eric.  BLAS-backed 103→64→32→1 MLP. mlp.cpp + job_mlp.sl
 │   │   ├── dt/   ← Eric.  Histogram CART, Gini. dt.cpp + job_dt.sl
 │   │   └── nb/   ← Eric.  Hybrid Gaussian + Bernoulli NB. nb.cpp + job_nb.sl
 │   └── sklearn_xgb/          ← Python comparison harness (sklearn + XGBoost)
+├── results/
+│   ├── run1/                  ← archived pure-C++ sweep
+│   └── run2/                  ← final BLAS-backed KNN/MLP sweep
+├── analysis/                  ← plotting script and generated run figures
+├── EE451-Final-Paper/
+│   ├── main.pdf               ← latest report; source of truth for paper claims
+│   └── *.tex                  ← report source files
 ├── misc/
-│   ├── mlp.md                 ← MLP design doc + results log
-│   ├── dt.md                  ← DT  design doc + results log
-│   └── nb.md                  ← NB  design doc + results log
-└── EE451-Final-Paper/         ← empty submodule placeholder for the final paper
+│   ├── *.md                   ← design notes, historical planning, and run logs
+│   └── diff.md                ← C++ vs sklearn/XGBoost comparison notes
 ```
 
 ## Invariants when editing an algorithm file
@@ -56,9 +69,9 @@ All five algorithm files follow a tightly aligned convention so analytics_engine
   - `struct Metrics { double acc = 0.0, prec = 0.0, rec = 0.0, f1 = 0.0; };`
   - `static Dataset load_dataset(const std::string&, const std::string&);`
   - `static XModel train_serial(const std::vector<float>& X, const Labels& y, int n_rows, int n_features, ...);`
-  - `static XModel train_parallel_omp(...)` and `static XModel train_parallel_pthreads(...)` — same sig as train_serial.
+  - `static XModel train_parallel_omp(...)` and `static XModel train_parallel_pthreads(...)` where the algorithm has parallel training. KNN is lazy and parallelizes inference; its train step just stores data and row norms.
   - `static Labels predict_serial(const XModel&, const std::vector<float>& X, int n_rows, int n_features);`
-  - `static Labels predict_parallel(const XModel&, const std::vector<float>& X, int n_rows, int n_features);` — OpenMP over test rows.
+  - `static Labels predict_parallel(...)` or explicit `predict_parallel_omp(...)` / `predict_parallel_pthreads(...)` variants.
   - `static Metrics evaluate(const Labels& truth, const Labels& pred);`
   - `static void print_results(const std::string& tag, double train_ms, double infer_ms, const Metrics&);`
   - `int main(int argc, char* argv[])` — takes optional `train_csv` and `test_csv` paths; binaries also accept algorithm-specific hyperparams as argv[3+] (see each file's header).
@@ -69,7 +82,7 @@ All five algorithm files follow a tightly aligned convention so analytics_engine
   - Skip z-score normalization for: column names with prefix `"map_"`, exact name `"bomb_planted"`, and any column whose training values are all in `{0.0, 1.0}`. Passthrough columns keep their original 0/1 values (mean=0, sd=1 for them, so the uniform normalize pass leaves them alone).
   - Print `Dataset Info` block with `Normalize: N z-scored, M passthrough (binary/one-hot)` summary.
 
-- **Self-contained files**: loader + metrics code is **duplicated** across all five algorithm files by design. Do NOT preemptively extract them into a shared header — deferred as a followup once the paper is done. Each new algorithm file should copy the same loader/metrics block verbatim.
+- **Self-contained files**: loader + metrics code is **duplicated** across all five algorithm files by design. Do NOT preemptively extract them into a shared header unless explicitly requested. Each new algorithm file should copy the same loader/metrics block verbatim.
 
 - **Hyperparameters at top-of-file as `static constexpr`**: `N_THREADS = 8`, `SEED = 42` are common to all. Algorithm-specific constants (MAX_EPOCHS, MAX_DEPTH, K_NEIGHBORS, LAMBDA, etc.) live above the `Labels` alias.
 
@@ -77,23 +90,35 @@ All five algorithm files follow a tightly aligned convention so analytics_engine
 
 - **Deterministic parallel output**: parallel variants must produce the same predictions as serial (up to floating-point reduction order), and each algorithm's `main()` prints an `Accuracy parity check` block at the end comparing `|serial − omp|` and `|serial − pthreads|`. Expect `< 0.01` (often 0.0000).
 
+- **Run 2 backend policy**: KNN and MLP now require a CBLAS-compatible backend. Do not restore a pure-C++ fallback unless the user explicitly asks to resurrect Run 1. KNN uses BLAS only for inner dot-product panels and pins BLAS to one internal thread during outer OpenMP/pthreads query scheduling. MLP uses BLAS for minibatch GEMMs; its OpenMP and pthreads training entry points intentionally reuse the serial BLAS trainer.
+
 ## Build
 
-Single-file compile per algorithm, flags fixed for the paper's apples-to-apples comparison:
+Single-file compile per algorithm, flags fixed for the final Run 2 comparison:
 
 ```bash
-g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/<algo>/<algo>.cpp -o <algo> -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/svm/svm.cpp -o svm -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp -DKNN_USE_BLAS src/cpp/knn/knn.cpp -o knn -lpthread -lopenblas
+g++ -std=c++17 -O3 -march=native -fopenmp -DMLP_USE_BLAS src/cpp/mlp/mlp.cpp -o mlp -lpthread -lopenblas
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/dt/dt.cpp -o dt -lpthread
+g++ -std=c++17 -O3 -march=native -fopenmp src/cpp/nb/nb.cpp -o nb -lpthread
 ```
 
-Exactly what [job.sl](job.sl) runs on CARC. `-march=native` means builds are tied to the machine; don't move binaries between architectures.
+Exactly what [slurm/job_sweep.sl](slurm/job_sweep.sl) runs on CARC, with `module load gcc/13.3.0` and OpenBLAS available. `-march=native` means builds are tied to the machine; don't move binaries between architectures.
+
+Runtime thread policy matters:
+
+- KNN: pin BLAS to one internal thread (`OPENBLAS_NUM_THREADS=1`, `MKL_NUM_THREADS=1`, etc.) and let our OpenMP/pthreads code own query-block parallelism.
+- MLP: hand the thread budget to BLAS (`OPENBLAS_NUM_THREADS=$N_THREADS`, etc.) because the dense minibatch kernel is the experiment.
 
 ## Running
 
 On CARC (the correct path):
 
 ```bash
-sbatch job.sl              # compiles + runs all five; output to alljob.out
-sbatch job_analytics.sl    # runs analytics_engine; emits analytics_results.csv
+sbatch slurm/job.sl             # compiles + runs all five with run2 defaults; output to alljob.out
+sbatch slurm/job_analytics.sl   # runs analytics_engine; emits analytics_results.csv
+sbatch slurm/job_sweep.sl       # reproduces the {1,2,4,8}-thread C++ + sklearn/XGBoost sweep
 ```
 
 Per-algo SLURM scripts live in each algo's folder (e.g., [src/cpp/svm/job_svm.sl](src/cpp/svm/job_svm.sl)) and are run from within that folder with `cd src/cpp/svm && sbatch job_svm.sl`.
@@ -106,7 +131,7 @@ Local dev on macOS is intentionally unsupported — Apple Clang ships without Op
 ## Parallelization conventions
 
 - **OpenMP for loop-level parallelism and inference** (`#pragma omp parallel for schedule(static) num_threads(N_THREADS)` over independent samples).
-- **pthreads for training with shared mutable state**. Reference pattern in [src/cpp/svm/svm.cpp](src/cpp/svm/svm.cpp) and [src/cpp/mlp/mlp.cpp](src/cpp/mlp/mlp.cpp): `ParState` + thread-local compute + `pthread_mutex_t` for reduction + `pthread_barrier_t`s for per-iteration sync (two barriers per epoch/batch/node; one mutex-acquisition per worker for non-iterative NB). Copy the pattern that fits the algorithm's granularity.
+- **pthreads for training or inference with shared state**. Reference pattern in [src/cpp/svm/svm.cpp](src/cpp/svm/svm.cpp) for epoch-level gradient reduction, [src/cpp/dt/dt.cpp](src/cpp/dt/dt.cpp) for per-node barriers, [src/cpp/nb/nb.cpp](src/cpp/nb/nb.cpp) for one final mutex-protected merge, and [src/cpp/knn/knn.cpp](src/cpp/knn/knn.cpp) for outer query-range scheduling around BLAS.
 - **Thread-local buffers must be hoisted out of any inner loop** (allocate once per thread, `std::fill` to zero per iteration). Allocating `Vec(thousands)` per batch dominates runtime.
 - **Only thread 0 may mutate shared scheduler state** (index shuffling, `batch_start`, epoch counters). Otherwise parallel-vs-serial comparisons become meaningless.
 - **Never assert bitwise equality between serial and parallel outputs** — float reduction order is non-deterministic. Check `|acc_serial − acc_parallel| < 0.01` instead (this check is already in each algorithm's `main()`).
@@ -119,14 +144,18 @@ Local dev on macOS is intentionally unsupported — Apple Clang ships without Op
 
 ## Documentation
 
-- [misc/mlp.md](misc/mlp.md), [misc/dt.md](misc/dt.md), [misc/nb.md](misc/nb.md) — per-algorithm design docs + results logs. Append a row per CARC run.
+- [EE451-Final-Paper/main.pdf](EE451-Final-Paper/main.pdf) — latest report and source of truth for final claims, tables, and wording.
+- [EE451-Final-Paper/*.tex](EE451-Final-Paper/) — LaTeX source for the report. It should match `main.pdf`, but if there is conflict, prefer the PDF unless the user asks to edit/recompile the paper.
+- [results/run1/results.md](results/run1/results.md) — archived pure-C++ sweep.
+- [results/run2/results.md](results/run2/results.md) — final BLAS-backed KNN/MLP sweep used by the paper unless explicitly labeled otherwise.
+- [misc/*.md](misc/) — design docs, historical planning notes, and results logs. Some entries predate the final BLAS rerun; cross-check against `main.pdf` and `results/run2/` before relying on old claims.
 - [src/sklearn_xgb/README.md](src/sklearn_xgb/README.md) — sklearn/XGBoost comparison harness overview.
-- The project proposal ([451 project proposal.pdf](451%20project%20proposal.pdf) / [proposal.tex](proposal.tex)) is the source of truth for the hypothesis and deliverables. The **MLP is the headline algorithm** — the proposal predicts it will scale best of all five due to its high arithmetic intensity, and the ratio `speedup_MLP / speedup_DT` is the central empirical claim.
+- [451 project proposal.pdf](451%20project%20proposal.pdf) is historical context. The proposal's MLP-scaling hypothesis was falsified; do not treat it as the current thesis.
 
 ## What NOT to do
 
-- Do **not** use external ML libraries (scikit-learn, Eigen, BLAS, etc.) in the C++ files. Hand-rolled C++ parallel code is the point of the paper. `src/sklearn_xgb/` is the intentional exception — it's the baseline comparison harness, not part of the five algorithms.
-- Do **not** refactor the duplicated `load_dataset` / `evaluate` into a shared header until the paper is done. The duplication is deliberate — it keeps each algorithm self-contained and easy to reason about.
+- Do **not** add scikit-learn, Eigen, or other ML frameworks to the C++ algorithm files. BLAS is intentionally allowed and required for KNN and MLP in the final Run 2 code path; SVM, DT, and NB should remain pure hand-written C++ unless the user explicitly changes the experiment.
+- Do **not** refactor the duplicated `load_dataset` / `evaluate` into a shared header unless explicitly requested. The duplication is deliberate — it keeps each algorithm self-contained and easy to reason about.
 - Do **not** change compile flags for a single algorithm. Apples-to-apples comparison across the five models requires identical flags.
 - Do **not** add commits, push branches, or open PRs without being asked — this is a student project and git actions should be explicitly directed.
 - Do **not** modify [data/train_cleaned.csv](data/train_cleaned.csv) or [data/test_cleaned.csv](data/test_cleaned.csv) — they are the fixed experiment input.
